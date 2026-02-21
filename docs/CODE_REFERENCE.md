@@ -160,13 +160,15 @@ All modules should use `**gui.api**` (defined in `**app_api.py**`) for every ope
 | `**set_display_mode(mode)**`                                       | `'live'`, `'raw'`, `'deconvolved'`, etc.                                               |
 | `**get_deconv_sigma()**` / `**get_deconv_iterations()**`           | Deconvolution parameters.                                                              |
 | `**set_deconv_sigma(value)**` / `**set_deconv_iterations(value)**` | Set deconvolution parameters.                                                          |
-| `**get_module_incoming_image(module_name)**`                       | Cached incoming image for module step (frame before that module processed).            |
+| `**get_module_incoming_image(module_name)**`                       | Cached incoming image for that module (updated by live pipeline and by **output_manual_from_module** when continuation runs, so Apply/Revert see correct upstream state). |
 | `**get_module_incoming_token(module_name)**`                       | Token for cached incoming image; changes each new frame.                               |
 | `**incoming_frame(module_name, frame, use_cached=False)**`         | Canonical module input. `use_cached=True` prefers cached incoming image when available. |
 | `**outgoing_frame(module_name, frame)**`                           | Canonical module output. Return through this from `process_frame(...)`.                |
-| `**continue_pipeline_from_slot(frame, start_slot_exclusive)**`     | Run remaining alteration steps after a slot.                                           |
-| `**continue_pipeline_from_module(module_name, frame)**`            | Run remaining alteration steps after a module.                                         |
-| `**output_manual_from_module(module_name, frame)**`                | Continue downstream steps and paint result to display (manual apply/revert safe path). |
+| `**continue_pipeline_from_slot(frame, start_slot_exclusive)**`     | Run remaining alteration steps after a slot; updates **\_pipeline_module_cache** for each step so **get_module_incoming_image** stays correct. |
+| `**continue_pipeline_from_module(module_name, frame)**`            | Run remaining alteration steps after a module (uses **continue_pipeline_from_slot**). |
+| `**output_manual_from_module(module_name, frame)**`                | Run pipeline from the next module onward and paint result; updates cache for downstream modules (so later Apply/Revert use correct incoming frames). |
+| `**build_alteration_apply_revert_ui(gui, module_name, apply_callback, auto_apply_attr=..., revert_snapshot_attr=None, default_auto_apply=True)**` | Add “Apply automatically” checkbox and Apply/Revert buttons (and separator). Call **first** in **build_ui**. **apply_callback(gui)** should get incoming image, store snapshot if needed, run your step, then **output_manual_from_module**. |
+| `**alteration_auto_apply(gui, auto_apply_attr, default=True)**`     | Whether to run the alteration in **process_frame** (guard: if **False**, return frame unchanged). |
 
 
 ### 4.10 Pipeline state (alteration modules)
@@ -174,9 +176,10 @@ All modules should use `**gui.api**` (defined in `**app_api.py**`) for every ope
 `**process_frame(frame, gui)**` receives **gui**; use `**api = gui.api`** and then:
 
 - `**frame = api.incoming_frame(MODULE_NAME, frame)**` on entry.
+- If using the shared Apply/Revert UI, guard with `**if not api.alteration_auto_apply(gui, "your_auto_apply_attr", default=True): return api.outgoing_frame(MODULE_NAME, frame)**` so the step is skipped when “Apply automatically” is off.
 - Process your algorithm.
 - `**return api.outgoing_frame(MODULE_NAME, frame_out)**` on exit.
-- If module manual actions need fixed source caching, use `**api.incoming_frame(MODULE_NAME, frame, use_cached=True)**` or `**api.get_module_incoming_image(MODULE_NAME)**`.
+- If module manual actions need fixed source caching, use `**api.get_module_incoming_image(MODULE_NAME)**` (and **output_manual_from_module**; the continuation updates the cache so downstream modules see the correct incoming frames).
 
 
 | Method                                                                                                                                                         | Use case                                           |

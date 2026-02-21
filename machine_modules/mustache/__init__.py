@@ -4,6 +4,7 @@ Applies radial distortion with k1*r^2 + k2*r^4 so barrel and pincushion can comb
 Center X/Y are saved; if < 0 uses frame center. Runs at slot 455 (after pincushion, before crop).
 """
 
+import time
 import numpy as np
 
 MODULE_INFO = {
@@ -17,7 +18,7 @@ MODULE_NAME = "mustache"
 
 
 def get_setting_keys():
-    return ["mustache_k1", "mustache_k2", "mustache_center_x", "mustache_center_y"]
+    return ["mustache_k1", "mustache_k2", "mustache_center_x", "mustache_center_y", "mustache_auto_apply"]
 
 
 # Spec for api.get_module_settings_for_save: (key, tag, converter, default)
@@ -31,36 +32,40 @@ _MUSTACHE_SAVE_SPEC = [
 
 def get_default_settings():
     """Return default settings for this module (extracted from save spec)."""
-    return {key: default for key, _tag, _conv, default in _MUSTACHE_SAVE_SPEC}
+    out = {key: default for key, _tag, _conv, default in _MUSTACHE_SAVE_SPEC}
+    out["mustache_auto_apply"] = True
+    return out
 
 
 def get_settings_for_save(gui=None):
-    """Return mustache k1, k2 and center from UI or loaded settings (auto fallback when UI not built)."""
+    """Return mustache k1, k2, center, and auto_apply from UI or loaded settings (auto fallback when UI not built)."""
     if gui is None or not getattr(gui, "api", None):
         return {}
-    return gui.api.get_module_settings_for_save(_MUSTACHE_SAVE_SPEC)
+    out = gui.api.get_module_settings_for_save(_MUSTACHE_SAVE_SPEC)
+    import dearpygui.dearpygui as dpg
+    if dpg.does_item_exist("mustache_auto_apply"):
+        out["mustache_auto_apply"] = bool(dpg.get_value("mustache_auto_apply"))
+    else:
+        out["mustache_auto_apply"] = getattr(gui, "mustache_auto_apply", True)
+    return out
 
 
-def process_frame(frame, gui):
-    """Apply mustache correction: r_src = r / (1 + k1*r_norm^2 + k2*r_norm^4). Center from saved X/Y or frame center."""
+def _apply_mustache(frame, gui):
+    """Apply mustache correction. Used by pipeline and by manual Apply."""
     from scipy.ndimage import map_coordinates
-
     api = gui.api
-    frame = api.incoming_frame(MODULE_NAME, frame)
     h, w = frame.shape[0], frame.shape[1]
     k1, k2, cx, cy = api.get_mustache_params()
     k1, k2 = float(k1), float(k2)
     if abs(k1) < 1e-9 and abs(k2) < 1e-9:
-        return api.outgoing_frame(MODULE_NAME, frame)
-
+        return np.asarray(frame, dtype=np.float32)
     cx, cy = float(cx), float(cy)
     if cx < 0 or cy < 0:
         cx = (w - 1) / 2.0
         cy = (h - 1) / 2.0
     r_max = np.sqrt(max(cx, w - 1 - cx) ** 2 + max(cy, h - 1 - cy) ** 2)
     if r_max < 1e-6:
-        return api.outgoing_frame(MODULE_NAME, frame)
-
+        return np.asarray(frame, dtype=np.float32)
     rows = np.arange(h, dtype=np.float64)
     cols = np.arange(w, dtype=np.float64)
     col_grid, row_grid = np.meshgrid(cols, rows)
@@ -71,7 +76,6 @@ def process_frame(frame, gui):
     r_norm = r_safe / r_max
     r2 = r_norm * r_norm
     r4 = r2 * r2
-    # r_src = r / (1 + k1*r_norm^2 + k2*r_norm^4); opposite signs for k1/k2 give mustache
     denom = 1.0 + k1 * r2 + k2 * r4
     r_src = np.where(r < 1e-6, 0.0, r_safe / np.maximum(denom, 0.1))
     scale = np.where(r < 1e-6, 1.0, r_src / r_safe)
@@ -79,7 +83,16 @@ def process_frame(frame, gui):
     src_row = cy + scale * dy
     coords = np.stack([src_row, src_col], axis=0)
     out = map_coordinates(frame, coords, order=1, mode="reflect", cval=0.0)
-    out = np.ascontiguousarray(out.astype(frame.dtype))
+    return np.ascontiguousarray(out.astype(np.float32))
+
+
+def process_frame(frame, gui):
+    """Apply mustache correction: r_src = r / (1 + k1*r_norm^2 + k2*r_norm^4). Center from saved X/Y or frame center."""
+    api = gui.api
+    frame = api.incoming_frame(MODULE_NAME, frame)
+    if not api.alteration_auto_apply(gui, "mustache_auto_apply", default=True):
+        return api.outgoing_frame(MODULE_NAME, frame)
+    out = _apply_mustache(frame, gui)
     return api.outgoing_frame(MODULE_NAME, out)
 
 
@@ -89,13 +102,21 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
 
     api = gui.api
 
+    def _maybe_preview():
+        """Throttle distortion preview to ~5/sec so slider drag doesn't queue many updates."""
+        now = time.monotonic()
+        if (now - getattr(gui, "_mustache_last_preview_t", 0.0)) < 0.2:
+            return
+        gui._mustache_last_preview_t = now
+        getattr(gui, "_refresh_distortion_preview", lambda: None)()
+
     def _apply(sender=None, app_data=None):
         gui.mustache_k1 = float(dpg.get_value("mustache_k1"))
         gui.mustache_k2 = float(dpg.get_value("mustache_k2"))
         gui.mustache_center_x = float(dpg.get_value("mustache_center_x"))
         gui.mustache_center_y = float(dpg.get_value("mustache_center_y"))
         api.save_settings()
-        getattr(gui, "_refresh_distortion_preview", lambda: None)()
+        _maybe_preview()
 
     loaded = api.get_loaded_settings()
     k1 = float(loaded.get("mustache_k1", 0.0))
@@ -107,8 +128,26 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
     gui.mustache_center_x = center_x
     gui.mustache_center_y = center_y
 
+    def _cb_apply(g):
+        raw = g.api.get_module_incoming_image(MODULE_NAME)
+        if raw is None:
+            g.api.set_status_message("No frame available (run acquisition first).")
+            return
+        g._mustache_revert_snapshot = raw.copy()
+        out = _apply_mustache(raw, g)
+        g.api.output_manual_from_module(MODULE_NAME, out)
+        g.api.set_status_message("Mustache correction applied to current frame.")
+
     with dpg.collapsing_header(parent=parent_tag, label="Mustache correction", default_open=False):
         with dpg.group(indent=10):
+            api.build_alteration_apply_revert_ui(
+                gui,
+                MODULE_NAME,
+                _cb_apply,
+                auto_apply_attr="mustache_auto_apply",
+                revert_snapshot_attr="_mustache_revert_snapshot",
+                default_auto_apply=True,
+            )
             dpg.add_slider_float(
                 label="k1",
                 default_value=k1,
@@ -142,8 +181,4 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
                 tag="mustache_center_y",
                 width=250,
                 callback=_apply,
-            )
-            dpg.add_text(
-                "k1*r^2 + k2*r^4. Opposite signs = mustache (S-shape). Center -1 = frame center.",
-                color=[150, 150, 150],
             )

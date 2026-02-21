@@ -93,13 +93,18 @@ Modules that do **not** implement this contract (e.g. Faxitron, which only does 
   In **`_push_frame`**, the app runs each step in slot order; the frame immediately before the first step with **slot ≥ 450** is stored as **`_frame_before_distortion`** for live preview.
 - **Current slots:** Dark = 100, Flat = 200, Banding = 300, Dead pixel = 400, Pincushion = 450, Mustache = 455, Image Enhancement = 480, Autocrop = 500, Background separator = 600.
 - **Live preview (distortion/crop/final post-steps):** Modules with **slot ≥ 450** (pincushion, mustache, autocrop, background separator) can call **`gui._refresh_distortion_preview()`** from their UI callbacks. The app re-runs only those steps on **`_frame_before_distortion`** and repaints the texture, so adjusting sliders updates the image immediately without waiting for the next frame. Preview is only available when in live mode and after at least one frame has been received.
-- **Manual-safe pipeline helpers:** For manual apply/revert from a pipeline module, use:
-  - **`gui.api.incoming_frame(module_name, frame, use_cached=True)`** (or `get_module_incoming_image(...)` if you need direct cache access)
-  - **`gui.api.get_module_incoming_image(module_name)`**
+- **Apply / Revert (reusable API):** Alteration modules that support “Apply automatically” plus manual **Apply** and **Revert** should use the shared API so behaviour and UI are consistent:
+  - **`gui.api.build_alteration_apply_revert_ui(gui, module_name, apply_callback, auto_apply_attr="...", revert_snapshot_attr="...", default_auto_apply=True)`** – Adds an “Apply automatically” checkbox and **Apply** / **Revert** buttons to the current DPG container (and a separator under the buttons). Call this **first** in your module’s **build_ui** so the block is the top of the section. **apply_callback** is a callable that receives **gui** and should: get incoming image via **get_module_incoming_image(module_name)**, optionally store a snapshot for Revert, run your step, then call **output_manual_from_module(module_name, out)**.
+  - **`gui.api.alteration_auto_apply(gui, auto_apply_attr, default=True)`** – Use in **process_frame** to decide whether to run the step: if it returns **False**, return the frame unchanged (e.g. **`return api.outgoing_frame(MODULE_NAME, frame)`**).
+  - Persist the auto-apply value by including **auto_apply_attr** in **get_setting_keys()** and **get_settings_for_save()** (the API does not manage the full settings dict).
+- **Manual Apply / Revert behaviour:**  
+  - **Revert** at a module: takes the frame **before** that module (incoming cache or snapshot), runs the **rest of the pipeline** (downstream only, that module skipped) and paints the result. The pipeline **module cache** is updated for every downstream step run, so **get_module_incoming_image** for later modules reflects this run (e.g. after reverting dead_pixel, applying pincushion uses the reverted frame, not the old cached one).  
+  - **Apply** at a module: takes the current **get_module_incoming_image(module_name)** (which may be from a previous Revert or live run), runs your step, then **output_manual_from_module(module_name, out)** which continues the pipeline and updates the cache for downstream modules.  
+  So Revert and Apply never “re-apply” upstream modules incorrectly; the cache is always updated when the continuation runs.
+- **Manual-safe pipeline helpers (direct use):** If you need custom UI instead of the shared block, use:
+  - **`gui.api.get_module_incoming_image(module_name)`** – Cached incoming frame for that module (updated by live pipeline and by **output_manual_from_module** when continuation runs).
   - **`gui.api.get_module_incoming_token(module_name)`**
-  - **`gui.api.output_manual_from_module(module_name, frame)`**
-  
-  This ensures manual edits start from module input cache and continue only downstream modules.
+  - **`gui.api.output_manual_from_module(module_name, frame)`** – Runs pipeline from the next module onward and paints; also updates **\_pipeline_module_cache** for each step so downstream modules see the correct incoming frames.
 
 ---
 

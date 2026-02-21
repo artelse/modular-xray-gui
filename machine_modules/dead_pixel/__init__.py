@@ -17,7 +17,7 @@ MODULE_NAME = "dead_pixel"
 
 
 def get_setting_keys():
-    return []
+    return ["dead_pixel_auto_apply"]
 
 
 def get_default_settings():
@@ -26,45 +26,59 @@ def get_default_settings():
         "dead_lines_enabled": True,
         "dead_vertical_lines": "",
         "dead_horizontal_lines": "",
+        "dead_pixel_auto_apply": True,
     }
 
 
 def get_settings_for_save(gui=None):
     """Return dead_lines settings from our UI or from gui state when module is disabled."""
     import dearpygui.dearpygui as dpg
-    if dpg.does_item_exist("dead_lines_enabled"):
-        return {
-            "dead_lines_enabled": dpg.get_value("dead_lines_enabled"),
+    if dpg.does_item_exist("dead_vertical_lines_input"):
+        out = {
+            "dead_lines_enabled": True,
             "dead_vertical_lines": dpg.get_value("dead_vertical_lines_input") or "",
             "dead_horizontal_lines": dpg.get_value("dead_horizontal_lines_input") or "",
         }
-    if gui is not None:
+    elif gui is not None:
         vlines, hlines = gui.api.get_dead_pixel_lines()
-        return {
-            "dead_lines_enabled": gui.api.dead_pixel_correction_enabled(),
+        out = {
+            "dead_lines_enabled": True,
             "dead_vertical_lines": ",".join(str(x) for x in vlines) if vlines else "",
             "dead_horizontal_lines": ",".join(str(x) for x in hlines),
         }
-    return {}
+    else:
+        out = {"dead_lines_enabled": True}
+    if dpg.does_item_exist("dead_pixel_auto_apply"):
+        out["dead_pixel_auto_apply"] = bool(dpg.get_value("dead_pixel_auto_apply"))
+    elif gui is not None:
+        out["dead_pixel_auto_apply"] = getattr(gui, "dead_pixel_auto_apply", True)
+    else:
+        out["dead_pixel_auto_apply"] = True
+    return out
 
 
-def process_frame(frame, gui):
-    """
-    Pure per-frame pipeline step.
-    Input/output manual helpers are not needed here because this module has no manual apply/revert actions.
-    """
+def _apply_dead_pixel(frame, gui):
+    """Apply dead line correction. Used by pipeline and by manual Apply."""
     api = gui.api
-    frame = api.incoming_frame(MODULE_NAME, frame)
     if not api.dead_pixel_correction_enabled():
-        return api.outgoing_frame(MODULE_NAME, frame)
+        return frame
     vlines, hlines = api.get_dead_pixel_lines()
     if len(vlines) == 0 and len(hlines) == 0:
-        return api.outgoing_frame(MODULE_NAME, frame)
-    out = correct_dead_lines(
+        return frame
+    return correct_dead_lines(
         frame,
         dead_vertical_lines=vlines,
         dead_horizontal_lines=hlines,
     )
+
+
+def process_frame(frame, gui):
+    """Per-frame pipeline step."""
+    api = gui.api
+    frame = api.incoming_frame(MODULE_NAME, frame)
+    if not api.alteration_auto_apply(gui, "dead_pixel_auto_apply", default=True):
+        return api.outgoing_frame(MODULE_NAME, frame)
+    out = _apply_dead_pixel(frame, gui)
     return api.outgoing_frame(MODULE_NAME, out)
 
 
@@ -73,10 +87,6 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
     import dearpygui.dearpygui as dpg
 
     api = gui.api
-
-    def _apply_enabled(sender=None, app_data=None):
-        gui.dead_lines_enabled = dpg.get_value("dead_lines_enabled")
-        api.save_settings()
 
     def _apply_vertical_lines(sender=None, app_data=None):
         raw = (dpg.get_value("dead_vertical_lines_input") or "").strip()
@@ -91,11 +101,27 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
     loaded = api.get_loaded_settings()
     vlines_str = loaded.get("dead_vertical_lines", "")
     hlines_str = loaded.get("dead_horizontal_lines", "") or ""
+    gui.dead_lines_enabled = True  # no separate Enable checkbox; Apply automatically is the only gate
+
+    def _cb_apply(g):
+        raw = g.api.get_module_incoming_image(MODULE_NAME)
+        if raw is None:
+            g.api.set_status_message("No frame available (run acquisition first).")
+            return
+        g._dead_pixel_revert_snapshot = raw.copy()
+        out = _apply_dead_pixel(raw, g)
+        g.api.output_manual_from_module(MODULE_NAME, out)
+        g.api.set_status_message("Dead pixel correction applied to current frame.")
+
     with dpg.collapsing_header(parent=parent_tag, label="Dead Pixel Lines", default_open=False):
         with dpg.group(indent=10):
-            dpg.add_checkbox(
-                label="Enable", default_value=api.dead_pixel_correction_enabled(),
-                tag="dead_lines_enabled", callback=_apply_enabled
+            api.build_alteration_apply_revert_ui(
+                gui,
+                MODULE_NAME,
+                _cb_apply,
+                auto_apply_attr="dead_pixel_auto_apply",
+                revert_snapshot_attr="_dead_pixel_revert_snapshot",
+                default_auto_apply=True,
             )
             dpg.add_input_text(
                 label="Vertical (cols)", default_value=vlines_str,
@@ -107,5 +133,4 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
                 tag="dead_horizontal_lines_input", width=-120,
                 callback=_apply_horizontal_lines
             )
-            dpg.add_text("Comma-separated list (e.g., '661' or '100,200,300')", color=[150, 150, 150])
-            dpg.add_text("Applied after banding correction", color=[150, 150, 150])
+            dpg.add_text("Comma-separated list (e.g. 661 or 100,200,300)", color=[150, 150, 150])

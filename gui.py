@@ -734,11 +734,20 @@ class XrayGUI:
         return int(item.get("token", 0))
 
     def _continue_pipeline_from_slot(self, frame: np.ndarray, start_slot_exclusive: int):
+        """Run pipeline from slot > start_slot_exclusive. Updates _pipeline_module_cache for each
+        module run so get_module_incoming_image() reflects the last manual or live run (e.g. after
+        Revert at X, downstream modules see incoming = frame that skipped X)."""
         out = np.asarray(frame, dtype=np.float32)
         token = int(getattr(self, "_pipeline_frame_token", 0))
         for slot, _module_name, step in getattr(self, "_alteration_pipeline", []):
             if slot <= start_slot_exclusive:
                 continue
+            # Cache this module's incoming so later Apply/Revert see correct upstream state
+            self._pipeline_module_cache[_module_name] = {
+                "token": token,
+                "slot": slot,
+                "frame": out.copy(),
+            }
             frame_in = out
             try:
                 out = step(out, self)

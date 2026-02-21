@@ -8,7 +8,7 @@ Use gui.api.xxx() instead of gui.xxx so the contract is explicit and stable.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 import numpy as np
 
 
@@ -498,6 +498,66 @@ class AppAPI:
 
     def set_deconv_iterations(self, value: int) -> None:
         self._gui.deconv_iterations = value
+
+    # ─── Reusable "Apply automatically" + Apply / Revert for alteration modules ─
+    def build_alteration_apply_revert_ui(
+        self,
+        gui: Any,
+        module_name: str,
+        apply_callback: Callable[[Any], None],
+        *,
+        auto_apply_attr: str,
+        revert_snapshot_attr: Optional[str] = None,
+        default_auto_apply: bool = True,
+    ) -> None:
+        """
+        Add 'Apply automatically' checkbox and Apply / Revert buttons to the current DPG container.
+        Call from inside your module's build_ui (e.g. inside a dpg.group).
+
+        - module_name: MODULE_NAME for get_module_incoming_image / output_manual_from_module.
+        - apply_callback: callable(gui). Called when Apply is clicked. It should:
+          get_module_incoming_image(module_name), set gui.<revert_snapshot_attr> = raw.copy(),
+          apply your step, then output_manual_from_module(module_name, out).
+        - auto_apply_attr: gui attribute for the checkbox (e.g. 'dark_correction_auto_apply').
+          Include this key in get_setting_keys() and get_settings_for_save() so it persists.
+        - revert_snapshot_attr: gui attribute for snapshot from last Apply (e.g. '_dark_correction_revert_snapshot').
+        """
+        import dearpygui.dearpygui as dpg
+
+        loaded = self.get_loaded_settings()
+        setattr(gui, auto_apply_attr, loaded.get(auto_apply_attr, default_auto_apply))
+        if revert_snapshot_attr is not None:
+            setattr(gui, revert_snapshot_attr, None)
+
+        def _cb_auto(sender: Any = None, app_data: Any = None) -> None:
+            setattr(gui, auto_apply_attr, bool(dpg.get_value(auto_apply_attr)))
+            self.save_settings()
+
+        def _cb_revert(sender: Any = None, app_data: Any = None) -> None:
+            incoming = self.get_module_incoming_image(module_name)
+            raw = incoming if incoming is not None else getattr(gui, revert_snapshot_attr, None)
+            if raw is None:
+                self.set_status_message("No frame available (run acquisition first).")
+                return
+            self.output_manual_from_module(module_name, raw.copy())
+
+        dpg.add_checkbox(
+            label="Apply automatically",
+            default_value=getattr(gui, auto_apply_attr),
+            tag=auto_apply_attr,
+            callback=_cb_auto,
+        )
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Apply", callback=lambda: apply_callback(gui), width=100)
+            dpg.add_button(label="Revert", callback=_cb_revert, width=100)
+        dpg.add_separator()
+
+    def alteration_auto_apply(self, gui: Any, auto_apply_attr: str, default: bool = True) -> bool:
+        """
+        Return whether the alteration step should run in the pipeline (for process_frame guard).
+        When False, process_frame should return frame unchanged.
+        """
+        return bool(getattr(gui, auto_apply_attr, default))
 
     # ─── Internal ref (for callbacks that must call back into gui) ───────────
     # Some DPG callbacks are bound to gui methods (e.g. gui._cb_banding_enabled).

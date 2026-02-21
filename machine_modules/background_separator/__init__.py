@@ -85,8 +85,7 @@ def process_frame(frame: np.ndarray, gui) -> np.ndarray:
     gui._bgsep_result = None
     gui._bgsep_last_preview_key = None
 
-    auto_apply = bool(getattr(gui, "_bgsep_auto_workflow", False))
-    if not auto_apply:
+    if not gui.api.alteration_auto_apply(gui, "background_separator_auto_workflow", default=False):
         gui._bgsep_hist_active = False
         gui._bgsep_hist_cutoff = None
         return api.outgoing_frame(MODULE_NAME, frame)
@@ -185,13 +184,6 @@ def _cb_offset(sender, app_data, gui):
     gui.api.save_settings()
 
 
-def _cb_auto(sender, app_data, gui):
-    import dearpygui.dearpygui as dpg
-
-    gui._bgsep_auto_workflow = bool(dpg.get_value("background_separator_auto_workflow"))
-    gui.api.save_settings()
-
-
 def _cb_live_preview(sender, app_data, gui):
     import dearpygui.dearpygui as dpg
 
@@ -227,9 +219,9 @@ def _cb_revert(gui):
 def build_ui(gui, parent_tag: str = "control_panel") -> None:
     import dearpygui.dearpygui as dpg
 
-    loaded = gui.api.get_loaded_settings()
+    api = gui.api
+    loaded = api.get_loaded_settings()
     gui._bgsep_offset = float(loaded.get("background_separator_offset", 5.0))
-    gui._bgsep_auto_workflow = bool(loaded.get("background_separator_auto_workflow", False))
     gui._bgsep_live_preview = bool(loaded.get("background_separator_live_preview", True))
     gui._bgsep_last_preview_t = 0.0
     gui._bgsep_last_preview_key = None
@@ -242,6 +234,14 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
 
     with dpg.collapsing_header(parent=parent_tag, label="Background separator", default_open=False):
         with dpg.group(indent=10):
+            api.build_alteration_apply_revert_ui(
+                gui,
+                MODULE_NAME,
+                _cb_apply_manual,
+                auto_apply_attr="background_separator_auto_workflow",
+                revert_snapshot_attr="_bgsep_raw_frame",
+                default_auto_apply=False,
+            )
             dpg.add_text(
                 "Flattens bright uncovered sensor background by clipping near-white values.",
                 color=[150, 150, 150],
@@ -257,24 +257,8 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
                 width=-120,
             )
             dpg.add_checkbox(
-                label="Auto apply (all frames)",
-                default_value=gui._bgsep_auto_workflow,
-                tag="background_separator_auto_workflow",
-                callback=lambda s, a: _cb_auto(s, a, gui),
-            )
-            dpg.add_checkbox(
                 label="Live preview while tuning",
                 default_value=gui._bgsep_live_preview,
                 tag="background_separator_live_preview",
                 callback=lambda s, a: _cb_live_preview(s, a, gui),
-            )
-            dpg.add_button(
-                label="Apply separator",
-                callback=lambda: _cb_apply_manual(gui),
-                width=-1,
-            )
-            dpg.add_button(
-                label="Revert to raw",
-                callback=lambda: _cb_revert(gui),
-                width=-1,
             )

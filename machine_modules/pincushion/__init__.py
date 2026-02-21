@@ -3,6 +3,7 @@ Pincushion distortion correction alteration module.
 Applies radial distortion correction (pincushion). Center X/Y are saved settings; if not set (< 0) uses frame center. Runs at slot 450.
 """
 
+import time
 import numpy as np
 
 MODULE_INFO = {
@@ -16,7 +17,7 @@ MODULE_NAME = "pincushion"
 
 
 def get_setting_keys():
-    return ["pincushion_strength", "pincushion_center_x", "pincushion_center_y"]
+    return ["pincushion_strength", "pincushion_center_x", "pincushion_center_y", "pincushion_auto_apply"]
 
 
 # Spec for api.get_module_settings_for_save: (key, tag, converter, default)
@@ -29,54 +30,64 @@ _PINCUSHION_SAVE_SPEC = [
 
 def get_default_settings():
     """Return default settings for this module (extracted from save spec)."""
-    return {key: default for key, _tag, _conv, default in _PINCUSHION_SAVE_SPEC}
+    out = {key: default for key, _tag, _conv, default in _PINCUSHION_SAVE_SPEC}
+    out["pincushion_auto_apply"] = True
+    return out
 
 
 def get_settings_for_save(gui=None):
-    """Return pincushion strength and center from UI or loaded settings (auto fallback when UI not built)."""
+    """Return pincushion strength, center, and auto_apply from UI or loaded settings (auto fallback when UI not built)."""
     if gui is None or not getattr(gui, "api", None):
         return {}
-    return gui.api.get_module_settings_for_save(_PINCUSHION_SAVE_SPEC)
+    out = gui.api.get_module_settings_for_save(_PINCUSHION_SAVE_SPEC)
+    import dearpygui.dearpygui as dpg
+    if dpg.does_item_exist("pincushion_auto_apply"):
+        out["pincushion_auto_apply"] = bool(dpg.get_value("pincushion_auto_apply"))
+    else:
+        out["pincushion_auto_apply"] = getattr(gui, "pincushion_auto_apply", True)
+    return out
 
 
-def process_frame(frame, gui):
-    """Apply pincushion correction: sample from r_src = r / (1 + k*r_norm^2). Center from saved X/Y or frame center."""
+def _apply_pincushion(frame, gui):
+    """Apply pincushion correction. Used by pipeline and by manual Apply."""
     from scipy.ndimage import map_coordinates
-
     api = gui.api
-    frame = api.incoming_frame(MODULE_NAME, frame)
     h, w = frame.shape[0], frame.shape[1]
     k, cx, cy = api.get_pincushion_params()
     k = float(k)
     if abs(k) < 1e-9:
-        return api.outgoing_frame(MODULE_NAME, frame)
-
+        return np.asarray(frame, dtype=np.float32)
     cx, cy = float(cx), float(cy)
     if cx < 0 or cy < 0:
         cx = (w - 1) / 2.0
         cy = (h - 1) / 2.0
-    # Max radius from center to corner (normalize so strength is scale-invariant)
     r_max = np.sqrt(max(cx, w - 1 - cx) ** 2 + max(cy, h - 1 - cy) ** 2)
     if r_max < 1e-6:
-        return api.outgoing_frame(MODULE_NAME, frame)
-
+        return np.asarray(frame, dtype=np.float32)
     rows = np.arange(h, dtype=np.float64)
     cols = np.arange(w, dtype=np.float64)
     col_grid, row_grid = np.meshgrid(cols, rows)
     dx = col_grid - cx
     dy = row_grid - cy
     r = np.sqrt(dx * dx + dy * dy)
-    # Where r is tiny, no remap
     r_safe = np.where(r < 1e-6, 1.0, r)
     r_norm = r_safe / r_max
-    # r_src = r / (1 + k * r_norm^2) -> sample from closer to center (pincushion correction)
     r_src = r_safe / (1.0 + k * (r_norm * r_norm))
     scale = np.where(r < 1e-6, 1.0, r_src / r_safe)
     src_col = cx + scale * dx
     src_row = cy + scale * dy
     coords = np.stack([src_row, src_col], axis=0)
     out = map_coordinates(frame, coords, order=1, mode="reflect", cval=0.0)
-    out = np.ascontiguousarray(out.astype(frame.dtype))
+    return np.ascontiguousarray(out.astype(np.float32))
+
+
+def process_frame(frame, gui):
+    """Apply pincushion correction: sample from r_src = r / (1 + k*r_norm^2). Center from saved X/Y or frame center."""
+    api = gui.api
+    frame = api.incoming_frame(MODULE_NAME, frame)
+    if not api.alteration_auto_apply(gui, "pincushion_auto_apply", default=True):
+        return api.outgoing_frame(MODULE_NAME, frame)
+    out = _apply_pincushion(frame, gui)
     return api.outgoing_frame(MODULE_NAME, out)
 
 
@@ -86,12 +97,20 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
 
     api = gui.api
 
+    def _maybe_preview():
+        """Throttle distortion preview to ~5/sec so slider drag doesn't queue many updates."""
+        now = time.monotonic()
+        if (now - getattr(gui, "_pincushion_last_preview_t", 0.0)) < 0.2:
+            return
+        gui._pincushion_last_preview_t = now
+        getattr(gui, "_refresh_distortion_preview", lambda: None)()
+
     def _apply(sender=None, app_data=None):
         gui.pincushion_strength = float(dpg.get_value("pincushion_strength"))
         gui.pincushion_center_x = float(dpg.get_value("pincushion_center_x"))
         gui.pincushion_center_y = float(dpg.get_value("pincushion_center_y"))
         api.save_settings()
-        getattr(gui, "_refresh_distortion_preview", lambda: None)()
+        _maybe_preview()
 
     loaded = api.get_loaded_settings()
     strength = float(loaded.get("pincushion_strength", 0.0))
@@ -101,8 +120,26 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
     gui.pincushion_center_x = center_x
     gui.pincushion_center_y = center_y
 
+    def _cb_apply(g):
+        raw = g.api.get_module_incoming_image(MODULE_NAME)
+        if raw is None:
+            g.api.set_status_message("No frame available (run acquisition first).")
+            return
+        g._pincushion_revert_snapshot = raw.copy()
+        out = _apply_pincushion(raw, g)
+        g.api.output_manual_from_module(MODULE_NAME, out)
+        g.api.set_status_message("Pincushion correction applied to current frame.")
+
     with dpg.collapsing_header(parent=parent_tag, label="Pincushion correction", default_open=False):
         with dpg.group(indent=10):
+            api.build_alteration_apply_revert_ui(
+                gui,
+                MODULE_NAME,
+                _cb_apply,
+                auto_apply_attr="pincushion_auto_apply",
+                revert_snapshot_attr="_pincushion_revert_snapshot",
+                default_auto_apply=True,
+            )
             dpg.add_slider_float(
                 label="Strength",
                 default_value=strength,
@@ -126,8 +163,4 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
                 tag="pincushion_center_y",
                 width=250,
                 callback=_apply,
-            )
-            dpg.add_text(
-                "Center X/Y in pixels. Use -1 for frame center. Positive strength = pincushion correction.",
-                color=[150, 150, 150],
             )

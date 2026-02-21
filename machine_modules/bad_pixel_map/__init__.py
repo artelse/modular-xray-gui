@@ -111,7 +111,7 @@ def _get_current_mask_for_preview(gui):
 
 
 def _update_main_view_preview(gui) -> None:
-    """If 'Show in main view' is on, paint current mask to main window (scaled to fit)."""
+    """If 'Show pixel map preview' is on, paint current mask to main window (scaled to fit)."""
     if not getattr(gui, "bad_pixel_map_show_in_main_view", False):
         return
     mask = _get_current_mask_for_preview(gui)
@@ -168,7 +168,7 @@ def process_frame(frame: np.ndarray, gui) -> np.ndarray:
     """Replace bad pixels (from loaded map) with median of 3×3 good neighbors when auto correct is on."""
     api = gui.api
     frame = api.incoming_frame(MODULE_NAME, frame)
-    if not getattr(gui, "bad_pixel_map_auto_correct", True):
+    if not api.alteration_auto_apply(gui, "bad_pixel_map_auto_correct", default=True):
         return api.outgoing_frame(MODULE_NAME, frame)
     mask = getattr(gui, "bad_pixel_map_mask", None)
     if mask is None or mask.shape != frame.shape:
@@ -216,36 +216,23 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
         else:
             api.clear_main_view_preview()
 
-    def _apply_auto_correct(sender=None, app_data=None):
-        gui.bad_pixel_map_auto_correct = bool(dpg.get_value("bad_pixel_map_auto_correct"))
-        api.save_settings()
-
-    def _cb_correct(sender=None, app_data=None):
+    def _cb_apply(g):
         """Apply bad pixel correction to current pipeline input and paint to display."""
-        raw = api.get_module_incoming_image(MODULE_NAME)
-        mask = getattr(gui, "bad_pixel_map_mask", None)
+        raw = g.api.get_module_incoming_image(MODULE_NAME)
+        mask = getattr(g, "bad_pixel_map_mask", None)
         if raw is None:
-            api.set_status_message("No frame available (run acquisition first).")
+            g.api.set_status_message("No frame available (run acquisition first).")
             return
         if mask is None or not np.any(mask):
-            api.set_status_message("No bad pixel map loaded.")
+            g.api.set_status_message("No bad pixel map loaded.")
             return
         if raw.shape != mask.shape:
-            api.set_status_message("Map resolution does not match frame.")
+            g.api.set_status_message("Map resolution does not match frame.")
             return
-        gui._bad_pixel_map_raw_frame = raw.copy()
+        g._bad_pixel_map_raw_frame = raw.copy()
         corrected = replace_bad_pixels(np.asarray(raw, dtype=np.float32), mask)
-        api.output_manual_from_module(MODULE_NAME, corrected)
-        api.set_status_message("Bad pixel correction applied to current frame.")
-
-    def _cb_revert(sender=None, app_data=None):
-        """Revert display to frame before last manual Correct."""
-        raw = getattr(gui, "_bad_pixel_map_raw_frame", None)
-        if raw is None:
-            api.set_status_message("No raw snapshot to revert (use Correct first).")
-            return
-        api.output_manual_from_module(MODULE_NAME, raw.copy())
-        api.set_status_message("Reverted to frame before bad pixel correction.")
+        g.api.output_manual_from_module(MODULE_NAME, corrected)
+        g.api.set_status_message("Bad pixel correction applied to current frame.")
 
     def _cb_build(sender=None, app_data=None):
         dark = api.get_dark_field()
@@ -303,19 +290,16 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
 
     with dpg.collapsing_header(parent=parent_tag, label="Bad pixel map", default_open=False):
         with dpg.group(indent=10):
-            dpg.add_text("Uses loaded dark & flat for this sensor. Cold pixels from flat, hot from dark.", color=[150, 150, 150])
-            dpg.add_text(_status(), tag="bad_pixel_map_status")
-            dpg.add_checkbox(
-                label="Auto correct",
-                default_value=auto_correct,
-                tag="bad_pixel_map_auto_correct",
-                callback=_apply_auto_correct,
+            api.build_alteration_apply_revert_ui(
+                gui,
+                MODULE_NAME,
+                _cb_apply,
+                auto_apply_attr="bad_pixel_map_auto_correct",
+                revert_snapshot_attr="_bad_pixel_map_raw_frame",
+                default_auto_apply=True,
             )
-            dpg.add_text("Apply correction in pipeline to every frame when checked.", color=[120, 120, 120])
-            with dpg.group(horizontal=True):
-                dpg.add_button(label="Correct", callback=_cb_correct, width=100)
-                dpg.add_button(label="Revert", callback=_cb_revert, width=100)
-            dpg.add_text("Correct: apply to current frame once. Revert: undo last Correct.", color=[120, 120, 120])
+            dpg.add_text("Uses loaded dark & flat for this sensor.", color=[150, 150, 150])
+            dpg.add_text(_status(), tag="bad_pixel_map_status")
             dpg.add_slider_float(
                 label="Flat % (cold)",
                 default_value=flat_thresh,
@@ -326,7 +310,7 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
                 width=-120,
                 callback=_apply_flat_thresh,
             )
-            dpg.add_text("Bottom fraction of pixels marked cold (e.g. 0.005 = 0.5%)", color=[120, 120, 120])
+            dpg.add_text("Bottom fraction of pixels marked cold", color=[120, 120, 120])
             dpg.add_slider_float(
                 label="Dark % (hot)",
                 default_value=dark_thresh,
@@ -337,15 +321,17 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
                 width=-120,
                 callback=_apply_dark_thresh,
             )
-            dpg.add_text("Top fraction of pixels marked hot (e.g. 0.005 = 0.5%)", color=[120, 120, 120])
+            dpg.add_text("Top fraction of pixels marked hot", color=[120, 120, 120])
             dpg.add_checkbox(
-                label="Show in main view",
+                label="Show pixel map preview",
                 default_value=gui.bad_pixel_map_show_in_main_view,
                 tag="bad_pixel_map_show_in_main_view",
                 callback=_cb_show_in_main_view,
             )
-            dpg.add_text("Preview mask in main window (scaled to fit). Uncheck to restore image.", color=[120, 120, 120])
-            dpg.add_button(label="Build from dark & flat", callback=_cb_build)
-            dpg.add_button(label="Load saved map", callback=_cb_load)
-            dpg.add_button(label="Clear map", callback=_cb_clear)
+            dpg.add_separator()
+            dpg.add_button(label="Build from dark & flat", callback=_cb_build, width=-1)
+            # Control panel is 350px; content indent leaves ~330px - split for two equal buttons
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Load saved map", callback=_cb_load, width=150)
+                dpg.add_button(label="Clear map", callback=_cb_clear, width=150)
             _update_main_view_preview(gui)

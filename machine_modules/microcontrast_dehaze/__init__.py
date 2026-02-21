@@ -85,6 +85,7 @@ MODULE_NAME = "microcontrast_dehaze"
 
 def get_setting_keys():
     return [
+        "microcontrast_auto_apply",
         "microcontrast_clarity",
         "microcontrast_dehaze",
         "microcontrast_auto_workflow",
@@ -97,6 +98,7 @@ def get_setting_keys():
 
 def get_default_settings():
     return {
+        "microcontrast_auto_apply": False,
         "microcontrast_clarity": 0.0,
         "microcontrast_dehaze": 0.0,
         "microcontrast_auto_workflow": False,
@@ -111,6 +113,7 @@ def get_settings_for_save(gui=None):
     import dearpygui.dearpygui as dpg
     if dpg.does_item_exist("microcontrast_clarity"):
         return {
+            "microcontrast_auto_apply": bool(dpg.get_value("microcontrast_auto_apply")) if dpg.does_item_exist("microcontrast_auto_apply") else False,
             "microcontrast_clarity": float(dpg.get_value("microcontrast_clarity")),
             "microcontrast_dehaze": float(dpg.get_value("microcontrast_dehaze")),
             "microcontrast_auto_workflow": bool(dpg.get_value("microcontrast_auto_workflow")),
@@ -121,6 +124,7 @@ def get_settings_for_save(gui=None):
         }
     if gui is not None:
         return {
+            "microcontrast_auto_apply": bool(getattr(gui, "microcontrast_auto_apply", False)),
             "microcontrast_clarity": float(getattr(gui, "_microcontrast_clarity", 0.0)),
             "microcontrast_dehaze": float(getattr(gui, "_microcontrast_dehaze", 0.0)),
             "microcontrast_auto_workflow": bool(getattr(gui, "_microcontrast_auto_workflow", False)),
@@ -219,23 +223,25 @@ def process_frame(frame: np.ndarray, gui) -> np.ndarray:
     """
     Pipeline path:
     - Cache input frame at module entry for manual/live preview source.
-    - Auto-apply only when workflow request is active and enabled.
+    - If Apply automatically is off, pass through unchanged.
+    - Otherwise run deconv (if Enable deconv) and/or contrast (if Enable contrast).
     """
     api = gui.api
     frame = api.incoming_frame(MODULE_NAME, frame)
     # Keep latest module-entry frame so manual/live tuning can reuse it directly
-    # without rerunning earlier pipeline stages.
     gui._microcontrast_latest_input = np.asarray(frame, dtype=np.float32).copy()
     gui._microcontrast_latest_token = int(getattr(gui, "_microcontrast_latest_token", 0)) + 1
     frame_token = int(getattr(gui, "_microcontrast_latest_token", 0))
-    # Snapshot module input for manual actions; reset manual derived state for this new frame.
     gui._microcontrast_raw_frame = gui._microcontrast_latest_input.copy()
     gui._microcontrast_snapshot_token = frame_token
     gui._microcontrast_deconv_frame = None
     gui._microcontrast_result = None
     gui._microcontrast_last_preview_key = None
 
-    # Auto deconvolution and auto contrast are intentionally independent.
+    if not api.alteration_auto_apply(gui, "microcontrast_auto_apply", default=False):
+        return api.outgoing_frame(MODULE_NAME, frame)
+
+    # Enable deconv / Enable contrast control which steps run when module is applied.
     # If both are enabled, order is deconvolution first, then enhancement.
     out = np.asarray(frame, dtype=np.float32)
     auto_deconv = bool(getattr(gui, "_microcontrast_auto_deconv_workflow", False))
@@ -467,26 +473,53 @@ def _apply_deconv_manual(gui):
     api.set_status_message(f"Deconvolution applied (σ={sigma:.2f}, n={iterations})")
 
 
-def _revert_manual(gui):
+def _apply_full_manual(gui):
+    """Apply full enhancement: deconv (if enabled) then contrast (if enabled)."""
     api = gui.api
+    if not _ensure_snapshot(gui):
+        api.set_status_message("No frame available (run acquisition first).")
+        return
     raw = getattr(gui, "_microcontrast_raw_frame", None)
     if raw is None:
-        api.set_status_message("No raw snapshot; apply enhancement first")
+        api.set_status_message("No frame available (run acquisition first).")
+        return
+    out = np.asarray(raw, dtype=np.float32)
+    enable_deconv = bool(getattr(gui, "_microcontrast_auto_deconv_workflow", False))
+    enable_contrast = bool(getattr(gui, "_microcontrast_auto_workflow", False))
+    if enable_deconv and is_deconv_available():
+        sigma = float(getattr(gui, "_microcontrast_deconv_sigma", 1.0))
+        iterations = int(getattr(gui, "_microcontrast_deconv_iterations", 10))
+        out = deconvolve_richardson_lucy(out, sigma=sigma, iterations=iterations)
+        gui._microcontrast_deconv_frame = out.copy()
+    if enable_contrast:
+        clarity = float(getattr(gui, "_microcontrast_clarity", 0.0))
+        dehaze = float(getattr(gui, "_microcontrast_dehaze", 0.0))
+        if abs(clarity) > 1e-6 or dehaze > 0.0:
+            out = _enhance(out, clarity, dehaze)
+    gui._microcontrast_result = out
+    gui._microcontrast_last_preview_key = None
+    api.output_manual_from_module(MODULE_NAME, out)
+    api.set_status_message("Image enhancement applied.")
+
+
+def _revert_manual(gui):
+    api = gui.api
+    incoming = api.get_module_incoming_image(MODULE_NAME)
+    raw = incoming if incoming is not None else getattr(gui, "_microcontrast_raw_frame", None)
+    if raw is None:
+        api.set_status_message("No frame available (run acquisition first).")
         return
     gui._microcontrast_result = None
     gui._microcontrast_deconv_frame = None
     gui._microcontrast_last_preview_key = None
-    api.output_manual_from_module(MODULE_NAME, raw)
-    print(
-        f"[ImageEnhancement] manual revert to raw (token={int(getattr(gui, '_microcontrast_snapshot_token', -1))})",
-        flush=True,
-    )
-    api.set_status_message("Reverted to microcontrast raw snapshot")
+    api.output_manual_from_module(MODULE_NAME, np.asarray(raw, dtype=np.float32).copy())
+    api.set_status_message("Reverted to frame before image enhancement.")
 
 
 def build_ui(gui, parent_tag: str = "control_panel") -> None:
     import dearpygui.dearpygui as dpg
-    loaded = gui.api.get_loaded_settings()
+    api = gui.api
+    loaded = api.get_loaded_settings()
     gui._microcontrast_clarity = float(loaded.get("microcontrast_clarity", 0.0))
     gui._microcontrast_dehaze = float(loaded.get("microcontrast_dehaze", 0.0))
     gui._microcontrast_auto_workflow = bool(loaded.get("microcontrast_auto_workflow", False))
@@ -515,8 +548,15 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
 
     with dpg.collapsing_header(parent=parent_tag, label="Image Enhancement", default_open=False):
         with dpg.group(indent=10):
-            dep_msg = "Deconvolution ✓ | SciPy blur ✓" if (is_deconv_available() and _HAS_SCIPY) else "Some deps missing: install scikit-image and scipy"
-            dpg.add_text(dep_msg, color=[150, 150, 150])
+            api.build_alteration_apply_revert_ui(
+                gui,
+                MODULE_NAME,
+                _apply_full_manual,
+                auto_apply_attr="microcontrast_auto_apply",
+                revert_snapshot_attr="_microcontrast_raw_frame",
+                default_auto_apply=False,
+            )
+            dpg.add_text("Deconvolution", color=[200, 200, 200])
             dpg.add_slider_float(
                 label="Sigma",
                 default_value=gui._microcontrast_deconv_sigma,
@@ -536,11 +576,14 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
                 callback=lambda s, a: _cb_deconv_iterations(s, a, gui),
                 width=-120,
             )
-            dpg.add_button(
-                label="Apply deconvolution",
-                callback=lambda: _apply_deconv_manual(gui),
-                width=-1,
+            dpg.add_checkbox(
+                label="Enable deconv",
+                default_value=gui._microcontrast_auto_deconv_workflow,
+                tag="microcontrast_auto_deconv_workflow",
+                callback=lambda s, a: _cb_auto_deconv_workflow(s, a, gui),
             )
+            dpg.add_separator()
+            dpg.add_text("Contrast", color=[200, 200, 200])
             dpg.add_slider_float(
                 label="Clarity",
                 default_value=gui._microcontrast_clarity,
@@ -562,30 +605,15 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
                 width=-120,
             )
             dpg.add_checkbox(
-                label="Auto contrast enhancement (all frames)",
+                label="Enable contrast",
                 default_value=gui._microcontrast_auto_workflow,
                 tag="microcontrast_auto_workflow",
                 callback=lambda s, a: _cb_auto_workflow(s, a, gui),
             )
-            dpg.add_checkbox(
-                label="Auto deconvolution (all frames)",
-                default_value=gui._microcontrast_auto_deconv_workflow,
-                tag="microcontrast_auto_deconv_workflow",
-                callback=lambda s, a: _cb_auto_deconv_workflow(s, a, gui),
-            )
+            dpg.add_separator()
             dpg.add_checkbox(
                 label="Live preview while tuning",
                 default_value=gui._microcontrast_live_preview,
                 tag="microcontrast_live_preview",
                 callback=lambda s, a: _cb_live_preview(s, a, gui),
-            )
-            dpg.add_button(
-                label="Apply clarity/dehaze",
-                callback=lambda: _apply_manual(gui),
-                width=-1,
-            )
-            dpg.add_button(
-                label="Revert to raw",
-                callback=lambda: _revert_manual(gui),
-                width=-1,
             )

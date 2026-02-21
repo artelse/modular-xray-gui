@@ -22,6 +22,8 @@ All frames from the camera go through **`gui.api.submit_frame(frame)`** (which c
 
 **Live preview (distortion/crop/post-steps):** When modules with sliders call **`_refresh_distortion_preview()`** (e.g. pincushion, mustache, autocrop, background separator), the app re-runs only steps with **slot ≥ 450** on **`_frame_before_distortion`** and repaints, so you see the effect immediately without waiting for the next frame. Works only in live mode and after at least one frame has been received.
 
+**Apply / Revert (alteration modules):** Many alteration modules expose “Apply automatically”, **Apply**, and **Revert**. **Revert** shows the frame before that module and runs the rest of the pipeline (skipping that module); **Apply** runs that module on the current incoming frame and then the rest of the pipeline. When either runs, the app updates the **pipeline module cache** for each downstream step, so **get_module_incoming_image** for later modules reflects the last manual or live run (e.g. after reverting dead_pixel, applying pincushion uses the reverted frame). So modules do not incorrectly re-apply each other.
+
 **Important:** At **start of acquisition** the frame buffer is **cleared** so the display uses only frames from the current run (with current dark/flat). When opening a new TIFF in the Open Image module, the buffer is also cleared before submitting so one image is shown with dark/flat applied.
 
 ---

@@ -17,24 +17,50 @@ MODULE_NAME = "dark_correction"
 
 
 def get_setting_keys():
-    return []
+    return ["dark_correction_auto_apply"]
 
 
 def get_default_settings():
     """Return default settings for this module."""
     return {
         "dark_stack_n": 20,
+        "dark_correction_auto_apply": True,
     }
 
 
 def get_settings_for_save(gui=None):
-    """Return dark_stack_n from our UI or from gui state when module is disabled."""
+    """Return dark_stack_n and dark_correction_auto_apply from our UI or from gui state when module is disabled."""
     import dearpygui.dearpygui as dpg
+    out = {}
     if dpg.does_item_exist("dark_stack_slider"):
-        return {"dark_stack_n": int(dpg.get_value("dark_stack_slider"))}
-    if gui is not None:
-        return {"dark_stack_n": gui.api.get_dark_capture_stack_count()}
-    return {}
+        out["dark_stack_n"] = int(dpg.get_value("dark_stack_slider"))
+    elif gui is not None:
+        out["dark_stack_n"] = gui.api.get_dark_capture_stack_count()
+    else:
+        out["dark_stack_n"] = 20
+    if dpg.does_item_exist("dark_correction_auto_apply"):
+        out["dark_correction_auto_apply"] = bool(dpg.get_value("dark_correction_auto_apply"))
+    elif gui is not None:
+        out["dark_correction_auto_apply"] = getattr(gui, "dark_correction_auto_apply", True)
+    else:
+        out["dark_correction_auto_apply"] = True
+    return out
+
+
+def _apply_dark(frame: np.ndarray, gui) -> np.ndarray:
+    """Subtract dark from frame if loaded and shape matches; otherwise return frame unchanged."""
+    api = gui.api
+    dark = api.get_dark_field()
+    if dark is None or dark.shape != frame.shape:
+        return np.asarray(frame, dtype=np.float32)
+    frame = np.asarray(frame, dtype=np.float32)
+    d_min, d_max = float(dark.min()), float(dark.max())
+    f_min, f_max = float(frame.min()), float(frame.max())
+    f_range = f_max - f_min + 1e-10
+    if f_range > 1e-6 and (f_max > 1.5 * d_max or f_max > 5000):
+        scale = (d_max - d_min + 1e-6) / f_range
+        frame = (frame - f_min) * scale + d_min
+    return frame - dark
 
 
 def process_frame(frame: np.ndarray, gui) -> np.ndarray:
@@ -45,17 +71,10 @@ def process_frame(frame: np.ndarray, gui) -> np.ndarray:
     """
     api = gui.api
     frame = api.incoming_frame(MODULE_NAME, frame)
-    dark = api.get_dark_field()
-    if dark is None or dark.shape != frame.shape:
+    if not api.alteration_auto_apply(gui, "dark_correction_auto_apply", default=True):
         return api.outgoing_frame(MODULE_NAME, frame)
-    frame = np.asarray(frame, dtype=np.float32)
-    d_min, d_max = float(dark.min()), float(dark.max())
-    f_min, f_max = float(frame.min()), float(frame.max())
-    f_range = f_max - f_min + 1e-10
-    if f_range > 1e-6 and (f_max > 1.5 * d_max or f_max > 5000):
-        scale = (d_max - d_min + 1e-6) / f_range
-        frame = (frame - f_min) * scale + d_min
-    return api.outgoing_frame(MODULE_NAME, frame - dark)
+    out = _apply_dark(frame, gui)
+    return api.outgoing_frame(MODULE_NAME, out)
 
 
 def capture_dark(gui) -> bool:
@@ -90,12 +109,32 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
     """Optional: show dark correction status. Capture/Clear are triggered by main app."""
     import dearpygui.dearpygui as dpg
     api = gui.api
+
+    def _status():
+        dark = api.get_dark_field()
+        if dark is not None:
+            return f"Active ({dark.shape[1]}×{dark.shape[0]})"
+        return "No dark loaded"
+
+    def _cb_apply(g):
+        raw = g.api.get_module_incoming_image(MODULE_NAME)
+        if raw is None:
+            g.api.set_status_message("No frame available (run acquisition first).")
+            return
+        g._dark_correction_revert_snapshot = raw.copy()
+        out = _apply_dark(raw, g)
+        g.api.output_manual_from_module(MODULE_NAME, out)
+        g.api.set_status_message("Dark correction applied to current frame.")
+
     with dpg.collapsing_header(parent=parent_tag, label="Dark correction", default_open=False):
         with dpg.group(indent=10):
-            def _status():
-                dark = api.get_dark_field()
-                if dark is not None:
-                    return f"Active ({dark.shape[1]}×{dark.shape[0]})"
-                return "No dark loaded"
+            api.build_alteration_apply_revert_ui(
+                gui,
+                MODULE_NAME,
+                _cb_apply,
+                auto_apply_attr="dark_correction_auto_apply",
+                revert_snapshot_attr="_dark_correction_revert_snapshot",
+                default_auto_apply=True,
+            )
             dpg.add_text("Subtracts dark field when loaded.", color=[150, 150, 150])
             dpg.add_text(_status(), tag="dark_correction_status")
