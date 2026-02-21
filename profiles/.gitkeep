@@ -1,0 +1,2 @@
+# This file ensures the profiles/ directory is tracked by git
+# Actual profile files (*.json) are ignored

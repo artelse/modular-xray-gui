@@ -1,0 +1,2 @@
+# This file ensures the captures/ directory is tracked by git
+# Actual capture files (*.tif, *.tiff, etc.) are ignored

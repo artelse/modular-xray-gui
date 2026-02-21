@@ -1,0 +1,32 @@
+# Hamamatsu / X-ray acquisition GUI and modules
+# Install: pip install -r requirements.txt
+
+# ─── Core (main app, all camera/alteration modules) ───
+numpy
+dearpygui
+
+# ─── Image I/O and export (gui, open_image, ct_capture, experiments) ───
+Pillow
+tifffile
+
+# ─── Alteration modules: distortion, enhancement, resize ───
+# mustache, pincushion: scipy.ndimage.map_coordinates
+# microcontrast_dehaze: skimage.restoration.richardson_lucy, scipy.ndimage.gaussian_filter
+# open_image: skimage.transform.resize, scipy.ndimage.zoom (when resizing loaded TIFF)
+scikit-image
+scipy
+
+# ─── Camera / hardware (optional – only if you enable the module) ───
+# Hamamatsu C7942 + Faxitron: lib/hamamatsu_teensy.py (import usb1, usb1.USBContext)
+# Note: Install explicitly if needed: pip install libusb1. Required for Teensy/C7942 connection.
+libusb1
+
+# ESP HV Supply, Example Arduino powersupply: serial port list and connect
+pyserial
+
+# ASI camera capture (ZWO): machine_modules/asi_camera
+zwoasi
+
+# ─── Experiments / ZMQ server ───
+# experiments/zmq_server.py
+pyzmq

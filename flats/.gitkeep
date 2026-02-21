@@ -1,0 +1,2 @@
+# This file ensures the flats/ directory is tracked by git
+# Actual flat field files (*.npy) are ignored

@@ -1,0 +1,2 @@
+# This file ensures the darks/ directory is tracked by git
+# Actual dark field files (*.npy) are ignored

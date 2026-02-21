@@ -1,0 +1,32 @@
+*.S
+*.o
+*.map
+*.elf
+*.img
+e2i
+.sconsign.*
+sdk/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.vscode/
+*.code-workspace
+
+# Python virtual environment
+venv/
+env/
+ENV/
+
+# Application data directories (keep directory structure with .gitkeep)
+profiles/*
+!profiles/.gitkeep
+darks/*
+!darks/.gitkeep
+flats/*
+!flats/.gitkeep
+captures/*
+!captures/.gitkeep
+
+# User-specific settings
+settings.json
