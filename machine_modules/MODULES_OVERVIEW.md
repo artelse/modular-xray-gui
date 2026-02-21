@@ -118,6 +118,7 @@ Modules that do **not** implement this contract (e.g. Faxitron, which only does 
 | **background_separator** | Alteration (slot 600, manual + auto) | [background_separator/README.md](background_separator/README.md) |
 | **asi_camera** | Camera | [asi_camera/README.md](asi_camera/README.md) |
 | **hamamatsu_c7942** | Camera | [hamamatsu_c7942/README.md](hamamatsu_c7942/README.md) |
+| **hamamatsu_dc5** (C9730DK-11 / C9732) | Camera | [hamamatsu_dc5/README.md](hamamatsu_dc5/README.md) |
 | **open_image** | Camera | [open_image/README.md](open_image/README.md) |
 | **faxitron** | Machine | [faxitron/README.md](faxitron/README.md) |
 | **esp_hv_supply** | Machine (optional beam_supply) | [esp_hv_supply/README.md](esp_hv_supply/README.md) |

@@ -17,8 +17,8 @@ scikit-image
 scipy
 
 # ─── Camera / hardware (optional – only if you enable the module) ───
-# Hamamatsu C7942 + Faxitron: lib/hamamatsu_teensy.py (import usb1, usb1.USBContext)
-# Note: Install explicitly if needed: pip install libusb1. Required for Teensy/C7942 connection.
+# libusb1: Hamamatsu C7942 + Faxitron (lib/hamamatsu_teensy), C9730DK-11/C9732 (lib/hamamatsu_dc5)
+# On Windows you may need a libusb driver (e.g. Zadig) for the device.
 libusb1
 
 # ESP HV Supply, Example Arduino powersupply: serial port list and connect
