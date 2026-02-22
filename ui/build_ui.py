@@ -90,6 +90,7 @@ def build_ui(gui):
             with dpg.menu(label="File"):
                 dpg.add_menu_item(label="Export PNG...", callback=gui._cb_export_png)
                 dpg.add_menu_item(label="Save as TIFF...", callback=gui._cb_save_tiff)
+                dpg.add_menu_item(label="Save unprocessed TIF...", callback=gui._cb_save_raw_tiff)
                 dpg.add_menu_item(label="Quit", callback=lambda: dpg.stop_dearpygui())
             with dpg.menu(label="Settings"):
                 dpg.add_menu_item(label="Settings...", callback=gui._cb_show_settings)
@@ -115,6 +116,7 @@ def build_ui(gui):
                             dpg.add_button(label="Open image", tag="file_open_image_btn", width=-1, callback=gui._cb_file_open_image)
                             dpg.add_button(label="Run through processing", tag="file_run_processing_btn", width=-1, callback=gui._cb_file_run_through_processing)
                             dpg.add_button(label="Save TIF", tag="file_save_tiff_btn", width=-1, callback=gui._cb_file_save_tiff, enabled=False)
+                            dpg.add_button(label="Save unprocessed TIF", tag="file_save_raw_tiff_btn", width=-1, callback=gui._cb_file_save_raw_tiff, enabled=False)
 
                     if detector_modules:
                         try:

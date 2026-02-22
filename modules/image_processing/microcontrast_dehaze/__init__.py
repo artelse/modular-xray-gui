@@ -23,10 +23,22 @@ except Exception:
     gaussian_filter = None
     _HAS_SCIPY = False
 
+try:
+    from skimage.exposure import equalize_adapthist
+    _CLAHE_AVAILABLE = True
+except ImportError:
+    equalize_adapthist = None
+    _CLAHE_AVAILABLE = False
+
 
 def is_deconv_available() -> bool:
     """Return True if scikit-image is installed and deconvolution can run."""
     return _DECONV_AVAILABLE
+
+
+def is_clahe_available() -> bool:
+    """Return True if skimage.exposure.equalize_adapthist is available."""
+    return _CLAHE_AVAILABLE
 
 
 def gaussian_psf_2d(sigma: float, size: int = None) -> np.ndarray:
@@ -88,11 +100,16 @@ def get_setting_keys():
         "microcontrast_auto_apply",
         "microcontrast_clarity",
         "microcontrast_dehaze",
+        "microcontrast_clahe",
+        "microcontrast_gamma",
         "microcontrast_auto_workflow",
         "microcontrast_auto_deconv_workflow",
+        "microcontrast_auto_gamma_workflow",
+        "microcontrast_auto_clahe_workflow",
         "microcontrast_deconv_sigma",
         "microcontrast_deconv_iterations",
         "microcontrast_live_preview",
+        "microcontrast_auto_window_histogram",
     ]
 
 
@@ -101,11 +118,16 @@ def get_default_settings():
         "microcontrast_auto_apply": False,
         "microcontrast_clarity": 0.0,
         "microcontrast_dehaze": 0.0,
+        "microcontrast_clahe": 0.0,
+        "microcontrast_gamma": 1.0,
         "microcontrast_auto_workflow": False,
         "microcontrast_auto_deconv_workflow": False,
+        "microcontrast_auto_gamma_workflow": False,
+        "microcontrast_auto_clahe_workflow": False,
         "microcontrast_deconv_sigma": 1.0,
         "microcontrast_deconv_iterations": 10,
         "microcontrast_live_preview": True,
+        "microcontrast_auto_window_histogram": False,
     }
 
 
@@ -116,22 +138,32 @@ def get_settings_for_save(gui=None):
             "microcontrast_auto_apply": bool(dpg.get_value("microcontrast_auto_apply")) if dpg.does_item_exist("microcontrast_auto_apply") else False,
             "microcontrast_clarity": float(dpg.get_value("microcontrast_clarity")),
             "microcontrast_dehaze": float(dpg.get_value("microcontrast_dehaze")),
+            "microcontrast_clahe": float(dpg.get_value("microcontrast_clahe")),
+            "microcontrast_gamma": float(dpg.get_value("microcontrast_gamma")),
             "microcontrast_auto_workflow": bool(dpg.get_value("microcontrast_auto_workflow")),
             "microcontrast_auto_deconv_workflow": bool(dpg.get_value("microcontrast_auto_deconv_workflow")),
+            "microcontrast_auto_gamma_workflow": bool(dpg.get_value("microcontrast_auto_gamma_workflow")),
+            "microcontrast_auto_clahe_workflow": bool(dpg.get_value("microcontrast_auto_clahe_workflow")),
             "microcontrast_deconv_sigma": float(dpg.get_value("microcontrast_deconv_sigma")),
             "microcontrast_deconv_iterations": int(dpg.get_value("microcontrast_deconv_iterations")),
             "microcontrast_live_preview": bool(dpg.get_value("microcontrast_live_preview")),
+            "microcontrast_auto_window_histogram": bool(dpg.get_value("microcontrast_auto_window_histogram")),
         }
     if gui is not None:
         return {
             "microcontrast_auto_apply": bool(getattr(gui, "microcontrast_auto_apply", False)),
             "microcontrast_clarity": float(getattr(gui, "_microcontrast_clarity", 0.0)),
             "microcontrast_dehaze": float(getattr(gui, "_microcontrast_dehaze", 0.0)),
+            "microcontrast_clahe": float(getattr(gui, "_microcontrast_clahe", 0.0)),
+            "microcontrast_gamma": float(getattr(gui, "_microcontrast_gamma", 1.0)),
             "microcontrast_auto_workflow": bool(getattr(gui, "_microcontrast_auto_workflow", False)),
             "microcontrast_auto_deconv_workflow": bool(getattr(gui, "_microcontrast_auto_deconv_workflow", False)),
+            "microcontrast_auto_gamma_workflow": bool(getattr(gui, "_microcontrast_auto_gamma_workflow", False)),
+            "microcontrast_auto_clahe_workflow": bool(getattr(gui, "_microcontrast_auto_clahe_workflow", False)),
             "microcontrast_deconv_sigma": float(getattr(gui, "_microcontrast_deconv_sigma", 1.0)),
             "microcontrast_deconv_iterations": int(getattr(gui, "_microcontrast_deconv_iterations", 10)),
             "microcontrast_live_preview": bool(getattr(gui, "_microcontrast_live_preview", True)),
+            "microcontrast_auto_window_histogram": bool(getattr(gui, "_microcontrast_auto_window_histogram", False)),
         }
     return {}
 
@@ -160,7 +192,58 @@ def _blur(img: np.ndarray, sigma: float) -> np.ndarray:
     return out
 
 
-def _enhance(frame: np.ndarray, clarity_amount: float, dehaze_amount: float) -> np.ndarray:
+def _apply_clahe(arr: np.ndarray, amount: float) -> np.ndarray:
+    """
+    Apply CLAHE (Contrast Limited Adaptive Histogram Equalization).
+    amount in 0..50; 0 = no change. Input/output float32, same value range.
+    """
+    if not _CLAHE_AVAILABLE or amount <= 0.0:
+        return arr
+    arr = np.asarray(arr, dtype=np.float32)
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return arr
+    lo = float(np.percentile(arr[finite], 0.5))
+    hi = float(np.percentile(arr[finite], 99.5))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return arr
+    norm = np.clip((arr - lo) / (hi - lo), 0.0, 1.0).astype(np.float64)
+    # clip_limit: 0.01 = subtle, ~0.15 = strong. Map 0..50 -> 0.01..0.15
+    clip_limit = 0.01 + (min(50.0, max(0.0, float(amount))) / 50.0) * 0.14
+    out_norm = equalize_adapthist(norm, clip_limit=clip_limit)
+    out = (np.asarray(out_norm, dtype=np.float32) * (hi - lo) + lo).astype(np.float32)
+    return np.nan_to_num(out, nan=lo, posinf=hi, neginf=lo)
+
+
+def _apply_gamma(arr: np.ndarray, gamma: float) -> np.ndarray:
+    """
+    Apply gamma curve: out = in^gamma. gamma 1.0 = no change.
+    Input/output float32, same value range.
+    """
+    if abs(float(gamma) - 1.0) < 1e-6:
+        return arr
+    arr = np.asarray(arr, dtype=np.float32)
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return arr
+    lo = float(np.percentile(arr[finite], 0.5))
+    hi = float(np.percentile(arr[finite], 99.5))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return arr
+    norm = np.clip((arr - lo) / (hi - lo), 1e-7, 1.0).astype(np.float32)
+    g = _clamp(float(gamma), 0.3, 3.0)
+    out_norm = np.power(norm, g).astype(np.float32)
+    out = (out_norm * (hi - lo) + lo).astype(np.float32)
+    return np.nan_to_num(out, nan=lo, posinf=hi, neginf=lo)
+
+
+def _enhance(
+    frame: np.ndarray,
+    clarity_amount: float,
+    dehaze_amount: float,
+    clahe_amount: float = 0.0,
+    gamma: float = 1.0,
+) -> np.ndarray:
     """
     Apply local clarity + global dehaze-like enhancement.
     Input/output are float32 in the original frame scale.
@@ -216,6 +299,12 @@ def _enhance(frame: np.ndarray, clarity_amount: float, dehaze_amount: float) -> 
 
     out = (norm * (hi - lo) + lo).astype(np.float32)
     out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if clahe_amount > 0.0:
+        out = _apply_clahe(out, clahe_amount)
+    if abs(float(gamma) - 1.0) >= 1e-6:
+        out = _apply_gamma(out, gamma)
+
     return out
 
 
@@ -275,13 +364,17 @@ def process_frame(frame: np.ndarray, gui) -> np.ndarray:
 
     clarity = float(getattr(gui, "_microcontrast_clarity", 0.0))
     dehaze = float(getattr(gui, "_microcontrast_dehaze", 0.0))
-    if auto_contrast and (abs(clarity) > 1e-6 or dehaze > 0.0):
-        out = _enhance(out, clarity, dehaze)
+    enable_clahe = bool(getattr(gui, "_microcontrast_auto_clahe_workflow", False))
+    enable_gamma = bool(getattr(gui, "_microcontrast_auto_gamma_workflow", False))
+    clahe = float(getattr(gui, "_microcontrast_clahe", 0.0)) if enable_clahe else 0.0
+    gamma = float(getattr(gui, "_microcontrast_gamma", 1.0)) if enable_gamma else 1.0
+    if auto_contrast and (abs(clarity) > 1e-6 or dehaze > 0.0 or clahe > 0.0 or abs(gamma - 1.0) >= 1e-6):
+        out = _enhance(out, clarity, dehaze, clahe_amount=clahe, gamma=gamma)
         applied_enhance = True
         if int(getattr(gui, "_microcontrast_last_console_token", -1)) != frame_token:
             print(
                 f"[ImageEnhancement] auto-enhance applied "
-                f"(token={frame_token}, clarity={clarity:.2f}, dehaze={dehaze:.2f})",
+                f"(token={frame_token}, clarity={clarity:.2f}, dehaze={dehaze:.2f}, clahe={clahe:.2f}, gamma={gamma:.2f})",
                 flush=True,
             )
             gui._microcontrast_last_console_token = frame_token
@@ -311,6 +404,20 @@ def _cb_dehaze(sender, app_data, gui):
     gui.api.save_settings()
 
 
+def _cb_clahe(sender, app_data, gui):
+    import dearpygui.dearpygui as dpg
+    gui._microcontrast_clahe = max(0.0, min(50.0, float(dpg.get_value("microcontrast_clahe"))))
+    _maybe_live_preview(gui)
+    gui.api.save_settings()
+
+
+def _cb_gamma(sender, app_data, gui):
+    import dearpygui.dearpygui as dpg
+    gui._microcontrast_gamma = max(0.3, min(3.0, float(dpg.get_value("microcontrast_gamma"))))
+    _maybe_live_preview(gui)
+    gui.api.save_settings()
+
+
 def _cb_auto_workflow(sender, app_data, gui):
     import dearpygui.dearpygui as dpg
     gui._microcontrast_auto_workflow = bool(dpg.get_value("microcontrast_auto_workflow"))
@@ -320,6 +427,20 @@ def _cb_auto_workflow(sender, app_data, gui):
 def _cb_auto_deconv_workflow(sender, app_data, gui):
     import dearpygui.dearpygui as dpg
     gui._microcontrast_auto_deconv_workflow = bool(dpg.get_value("microcontrast_auto_deconv_workflow"))
+    gui.api.save_settings()
+
+
+def _cb_auto_gamma_workflow(sender, app_data, gui):
+    import dearpygui.dearpygui as dpg
+    gui._microcontrast_auto_gamma_workflow = bool(dpg.get_value("microcontrast_auto_gamma_workflow"))
+    _maybe_live_preview(gui)
+    gui.api.save_settings()
+
+
+def _cb_auto_clahe_workflow(sender, app_data, gui):
+    import dearpygui.dearpygui as dpg
+    gui._microcontrast_auto_clahe_workflow = bool(dpg.get_value("microcontrast_auto_clahe_workflow"))
+    _maybe_live_preview(gui)
     gui.api.save_settings()
 
 
@@ -338,6 +459,12 @@ def _cb_deconv_iterations(sender, app_data, gui):
 def _cb_live_preview(sender, app_data, gui):
     import dearpygui.dearpygui as dpg
     gui._microcontrast_live_preview = bool(dpg.get_value("microcontrast_live_preview"))
+    gui.api.save_settings()
+
+
+def _cb_auto_window_histogram(sender, app_data, gui):
+    import dearpygui.dearpygui as dpg
+    gui._microcontrast_auto_window_histogram = bool(dpg.get_value("microcontrast_auto_window_histogram"))
     gui.api.save_settings()
 
 
@@ -371,31 +498,43 @@ def _apply_from_snapshot(gui, set_status: bool = True):
         return False
     clarity = float(getattr(gui, "_microcontrast_clarity", 0.0))
     dehaze = float(getattr(gui, "_microcontrast_dehaze", 0.0))
-    out = _enhance(src, clarity, dehaze)
+    enable_clahe = bool(getattr(gui, "_microcontrast_auto_clahe_workflow", False))
+    enable_gamma = bool(getattr(gui, "_microcontrast_auto_gamma_workflow", False))
+    clahe = float(getattr(gui, "_microcontrast_clahe", 0.0)) if enable_clahe else 0.0
+    gamma = float(getattr(gui, "_microcontrast_gamma", 1.0)) if enable_gamma else 1.0
+    out = _enhance(src, clarity, dehaze, clahe_amount=clahe, gamma=gamma)
     gui._microcontrast_result = out
     out_post = api.output_manual_from_module(MODULE_NAME, out)
     # Paint as current live frame so windowing/histogram continue to work naturally.
     # output_manual_from_module already paints/stores output.
+    # Auto-window histogram from the displayed frame when the option is on (use saved setting if attr not set yet, e.g. before panel opened).
+    auto_window = getattr(gui, "_microcontrast_auto_window_histogram", None)
+    if auto_window is None:
+        auto_window = bool(api.get_loaded_settings().get("microcontrast_auto_window_histogram", False))
+    if auto_window and hasattr(gui, "_cb_auto_window"):
+        gui._cb_auto_window()
     if set_status:
         api.set_status_message(
-            f"Enhancement applied (Clarity={clarity:.0f}, Dehaze={dehaze:.0f})"
+            f"Enhancement applied (Clarity={clarity:.0f}, Dehaze={dehaze:.0f}, CLAHE={clahe:.0f}, Gamma={gamma:.2f})"
         )
     gui._microcontrast_last_preview_key = (
         int(getattr(gui, "_microcontrast_snapshot_token", -1)),
         round(float(clarity), 4),
         round(float(dehaze), 4),
+        round(float(clahe), 4),
+        round(float(gamma), 4),
     )
     token = int(getattr(gui, "_microcontrast_snapshot_token", -1))
     if set_status:
         print(
             f"[ImageEnhancement] manual microcontrast applied "
-            f"(token={token}, src={src_kind}, clarity={clarity:.2f}, dehaze={dehaze:.2f})",
+            f"(token={token}, src={src_kind}, clarity={clarity:.2f}, dehaze={dehaze:.2f}, clahe={clahe:.2f}, gamma={gamma:.2f})",
             flush=True,
         )
     else:
         print(
             f"[ImageEnhancement] live microcontrast preview "
-            f"(token={token}, src={src_kind}, clarity={clarity:.2f}, dehaze={dehaze:.2f})",
+            f"(token={token}, src={src_kind}, clarity={clarity:.2f}, dehaze={dehaze:.2f}, clahe={clahe:.2f}, gamma={gamma:.2f})",
             flush=True,
         )
     return True
@@ -406,10 +545,16 @@ def _maybe_live_preview(gui):
         return
     clarity = float(getattr(gui, "_microcontrast_clarity", 0.0))
     dehaze = float(getattr(gui, "_microcontrast_dehaze", 0.0))
+    enable_clahe = bool(getattr(gui, "_microcontrast_auto_clahe_workflow", False))
+    enable_gamma = bool(getattr(gui, "_microcontrast_auto_gamma_workflow", False))
+    clahe = float(getattr(gui, "_microcontrast_clahe", 0.0)) if enable_clahe else 0.0
+    gamma = float(getattr(gui, "_microcontrast_gamma", 1.0)) if enable_gamma else 1.0
     preview_key = (
         int(getattr(gui, "_microcontrast_snapshot_token", -1)),
         round(float(clarity), 4),
         round(float(dehaze), 4),
+        round(float(clahe), 4),
+        round(float(gamma), 4),
     )
     # Skip redundant callbacks (DPG can queue many slider events with identical end values).
     if preview_key == getattr(gui, "_microcontrast_last_preview_key", None):
@@ -422,10 +567,16 @@ def _maybe_live_preview(gui):
     if not _ensure_snapshot(gui):
         return
     # Recompute key because ensure_snapshot may update snapshot token.
+    enable_clahe = bool(getattr(gui, "_microcontrast_auto_clahe_workflow", False))
+    enable_gamma = bool(getattr(gui, "_microcontrast_auto_gamma_workflow", False))
+    clahe_eff = float(getattr(gui, "_microcontrast_clahe", 0.0)) if enable_clahe else 0.0
+    gamma_eff = float(getattr(gui, "_microcontrast_gamma", 1.0)) if enable_gamma else 1.0
     preview_key = (
         int(getattr(gui, "_microcontrast_snapshot_token", -1)),
         round(float(getattr(gui, "_microcontrast_clarity", 0.0)), 4),
         round(float(getattr(gui, "_microcontrast_dehaze", 0.0)), 4),
+        round(clahe_eff, 4),
+        round(gamma_eff, 4),
     )
     if preview_key == getattr(gui, "_microcontrast_last_preview_key", None):
         return
@@ -494,8 +645,12 @@ def _apply_full_manual(gui):
     if enable_contrast:
         clarity = float(getattr(gui, "_microcontrast_clarity", 0.0))
         dehaze = float(getattr(gui, "_microcontrast_dehaze", 0.0))
-        if abs(clarity) > 1e-6 or dehaze > 0.0:
-            out = _enhance(out, clarity, dehaze)
+        enable_clahe = bool(getattr(gui, "_microcontrast_auto_clahe_workflow", False))
+        enable_gamma = bool(getattr(gui, "_microcontrast_auto_gamma_workflow", False))
+        clahe = float(getattr(gui, "_microcontrast_clahe", 0.0)) if enable_clahe else 0.0
+        gamma = float(getattr(gui, "_microcontrast_gamma", 1.0)) if enable_gamma else 1.0
+        if abs(clarity) > 1e-6 or dehaze > 0.0 or clahe > 0.0 or abs(gamma - 1.0) >= 1e-6:
+            out = _enhance(out, clarity, dehaze, clahe_amount=clahe, gamma=gamma)
     gui._microcontrast_result = out
     gui._microcontrast_last_preview_key = None
     api.output_manual_from_module(MODULE_NAME, out)
@@ -522,11 +677,16 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
     loaded = api.get_loaded_settings()
     gui._microcontrast_clarity = float(loaded.get("microcontrast_clarity", 0.0))
     gui._microcontrast_dehaze = float(loaded.get("microcontrast_dehaze", 0.0))
+    gui._microcontrast_clahe = min(50.0, max(0.0, float(loaded.get("microcontrast_clahe", 0.0))))
+    gui._microcontrast_gamma = float(loaded.get("microcontrast_gamma", 1.0))
     gui._microcontrast_auto_workflow = bool(loaded.get("microcontrast_auto_workflow", False))
     gui._microcontrast_auto_deconv_workflow = bool(loaded.get("microcontrast_auto_deconv_workflow", False))
+    gui._microcontrast_auto_gamma_workflow = bool(loaded.get("microcontrast_auto_gamma_workflow", False))
+    gui._microcontrast_auto_clahe_workflow = bool(loaded.get("microcontrast_auto_clahe_workflow", False))
     gui._microcontrast_deconv_sigma = float(loaded.get("microcontrast_deconv_sigma", 1.0))
     gui._microcontrast_deconv_iterations = int(loaded.get("microcontrast_deconv_iterations", 10))
     gui._microcontrast_live_preview = bool(loaded.get("microcontrast_live_preview", True))
+    gui._microcontrast_auto_window_histogram = bool(loaded.get("microcontrast_auto_window_histogram", False))
     if not hasattr(gui, "_microcontrast_raw_frame"):
         gui._microcontrast_raw_frame = None
     if not hasattr(gui, "_microcontrast_snapshot_token"):
@@ -583,6 +743,42 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
                 callback=lambda s, a: _cb_auto_deconv_workflow(s, a, gui),
             )
             dpg.add_separator()
+            dpg.add_text("Gamma", color=[200, 200, 200])
+            dpg.add_slider_float(
+                label="Gamma",
+                default_value=gui._microcontrast_gamma,
+                min_value=0.3,
+                max_value=3.0,
+                format="%.2f",
+                tag="microcontrast_gamma",
+                callback=lambda s, a: _cb_gamma(s, a, gui),
+                width=-120,
+            )
+            dpg.add_checkbox(
+                label="Enable gamma",
+                default_value=gui._microcontrast_auto_gamma_workflow,
+                tag="microcontrast_auto_gamma_workflow",
+                callback=lambda s, a: _cb_auto_gamma_workflow(s, a, gui),
+            )
+            dpg.add_separator()
+            dpg.add_text("CLAHE", color=[200, 200, 200])
+            dpg.add_slider_float(
+                label="CLAHE",
+                default_value=gui._microcontrast_clahe,
+                min_value=0.0,
+                max_value=50.0,
+                format="%.1f",
+                tag="microcontrast_clahe",
+                callback=lambda s, a: _cb_clahe(s, a, gui),
+                width=-120,
+            )
+            dpg.add_checkbox(
+                label="Enable CLAHE",
+                default_value=gui._microcontrast_auto_clahe_workflow,
+                tag="microcontrast_auto_clahe_workflow",
+                callback=lambda s, a: _cb_auto_clahe_workflow(s, a, gui),
+            )
+            dpg.add_separator()
             dpg.add_text("Contrast", color=[200, 200, 200])
             dpg.add_slider_float(
                 label="Clarity",
@@ -616,4 +812,10 @@ def build_ui(gui, parent_tag: str = "control_panel") -> None:
                 default_value=gui._microcontrast_live_preview,
                 tag="microcontrast_live_preview",
                 callback=lambda s, a: _cb_live_preview(s, a, gui),
+            )
+            dpg.add_checkbox(
+                label="Auto window histogram while tuning",
+                default_value=gui._microcontrast_auto_window_histogram,
+                tag="microcontrast_auto_window_histogram",
+                callback=lambda s, a: _cb_auto_window_histogram(s, a, gui),
             )

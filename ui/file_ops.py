@@ -78,6 +78,12 @@ def get_default_tiff_filename(gui) -> str:
     return f"{date_str}-{integ_time}-{gain}-{n}.tif"
 
 
+def get_default_raw_tiff_filename(gui) -> str:
+    """Default filename for unprocessed TIFF: same as TIFF but with -raw before .tif"""
+    base = get_default_tiff_filename(gui)
+    return base.replace(".tif", "-raw.tif").replace(".tiff", "-raw.tiff")
+
+
 def load_image_file_as_float32(gui, path: str) -> np.ndarray:
     """
     Load TIFF or PNG as 2D float32, resized to current frame size.
@@ -128,7 +134,20 @@ def cb_save_tiff(gui):
     if gui._get_export_frame() is None:
         gui._status_msg = "No frame to save"
         return
+    gui._tiff_save_raw = False
     dpg.configure_item("tiff_file_dialog", default_path=get_file_dialog_default_path(gui), default_filename=get_default_tiff_filename(gui))
+    dpg.show_item("tiff_file_dialog")
+
+
+def cb_save_raw_tiff(gui):
+    """Show TIFF save file dialog for unprocessed (raw) frame (before any pipeline module)."""
+    with gui.frame_lock:
+        raw = gui.raw_frame
+    if raw is None:
+        gui._status_msg = "No raw frame to save (acquire an image first)"
+        return
+    gui._tiff_save_raw = True
+    dpg.configure_item("tiff_file_dialog", default_path=get_file_dialog_default_path(gui), default_filename=get_default_raw_tiff_filename(gui))
     dpg.show_item("tiff_file_dialog")
 
 
@@ -184,16 +203,17 @@ def cb_file_run_through_processing(gui):
 
 
 def cb_file_save_tiff(gui):
-    """Show TIFF save file dialog (File section)."""
+    """Show TIFF save file dialog (File section) for processed frame."""
     if gui._get_export_frame() is None:
         gui._status_msg = "No frame to save (run an image through processing first)"
         return
+    gui._tiff_save_raw = False
     dpg.configure_item("tiff_file_dialog", default_path=get_file_dialog_default_path(gui), default_filename=get_default_tiff_filename(gui))
     dpg.show_item("tiff_file_dialog")
 
 
 def cb_tiff_file_selected(gui, sender, app_data):
-    """Handle file selected from TIFF save dialog: save 16-bit TIFF, update last dir."""
+    """Handle file selected from TIFF save dialog: save 16-bit TIFF (processed or raw), update last dir."""
     filepath = app_data.get("file_path_name", "")
     if not filepath:
         return
@@ -203,7 +223,12 @@ def cb_tiff_file_selected(gui, sender, app_data):
     if dir_path and pathlib.Path(dir_path).is_dir():
         gui._last_file_dialog_dir = dir_path
         gui._save_settings()
-    frame = gui._get_export_frame()
+    if getattr(gui, "_tiff_save_raw", False):
+        gui._tiff_save_raw = False
+        with gui.frame_lock:
+            frame = gui.raw_frame.copy() if gui.raw_frame is not None else None
+    else:
+        frame = gui._get_export_frame()
     if frame is None:
         gui._status_msg = "No frame to save"
         return
