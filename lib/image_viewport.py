@@ -4,20 +4,25 @@ Image viewport handling for zoom and pan functionality.
 Manages zoom level, pan offset, and mouse interactions (wheel zoom, click-drag pan).
 """
 
+from typing import Optional
+
 import dearpygui.dearpygui as dpg
 
 
 class ImageViewport:
     """Handles zoom and pan for an image widget."""
-    
-    def __init__(self, image_tag: str):
+
+    def __init__(self, image_tag: str, hover_area_tag: Optional[str] = None):
         """
         Initialize image viewport.
-        
+
         Args:
             image_tag: DearPyGui tag of the image widget to control
+            hover_area_tag: Optional tag of the area over which wheel/pan should be active
+                           (e.g. image_area). If None, uses image_tag.
         """
         self.image_tag = image_tag
+        self.hover_area_tag = hover_area_tag or image_tag
         
         # Zoom/pan state in UV space:
         # - zoom=1.0 shows full texture (uv 0..1)
@@ -59,20 +64,28 @@ class ImageViewport:
         rect = self._get_image_rect()
         if rect is None:
             return False
-        mx, my = dpg.get_mouse_pos()
+        mx, my = dpg.get_mouse_pos(local=False)
         x0, y0, x1, y1 = rect
         return x0 <= mx <= x1 and y0 <= my <= y1
-    
+
+    def _mouse_over_hover_area(self) -> bool:
+        """True if mouse is over the hover area (image panel), where wheel zoom should be active."""
+        try:
+            return dpg.is_item_hovered(self.hover_area_tag)
+        except Exception:
+            return False
+
     def handle_wheel(self, app_data: float) -> bool:
         """
         Handle mouse wheel scroll for zooming.
-        
+        Only active when mouse is over the hover area (e.g. image panel).
         Args:
             app_data: Wheel delta (positive = zoom in, negative = zoom out)
-            
         Returns:
             True if zoom was applied, False otherwise
         """
+        if not self._mouse_over_hover_area():
+            return False
         rect = self._get_image_rect()
         if rect is None:
             return False
@@ -80,7 +93,7 @@ class ImageViewport:
             return False
 
         x0, y0, x1, y1 = rect
-        mx, my = dpg.get_mouse_pos()
+        mx, my = dpg.get_mouse_pos(local=False)
         widget_w = x1 - x0
         widget_h = y1 - y0
         rel_x = self._clamp((mx - x0) / widget_w if widget_w > 0 else 0.5, 0.0, 1.0)
@@ -126,7 +139,7 @@ class ImageViewport:
             self._is_dragging = False
             return False
 
-        mouse_x, mouse_y = dpg.get_mouse_pos()
+        mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
         self._is_dragging = True
         self._drag_start_x = mouse_x
         self._drag_start_y = mouse_y
@@ -166,7 +179,7 @@ class ImageViewport:
         if widget_w <= 0 or widget_h <= 0:
             return False
 
-        mouse_x, mouse_y = dpg.get_mouse_pos()
+        mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
         delta_x = mouse_x - self._drag_start_x
         delta_y = mouse_y - self._drag_start_y
 

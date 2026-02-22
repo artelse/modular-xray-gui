@@ -3,17 +3,14 @@
 X-ray image acquisition application.
 Generic shell: image display, dark/flat, corrections, export. Imaging source and
 machine hardware (Faxitron, HV supply, etc.) are loadable modules.
+UI construction is delegated to the ui package (ui.build_ui, ui.constants, etc.).
 """
 
 import sys
 import os
-import re
 import time
 import threading
 import pathlib
-from datetime import datetime
-import shutil
-import math
 import numpy as np
 
 import dearpygui.dearpygui as dpg
@@ -30,120 +27,34 @@ from lib.image_viewport import ImageViewport
 from lib.settings import load_settings, save_settings, list_profiles, save_profile, apply_profile, set_current_profile
 from lib.app_api import AppAPI
 from modules.registry import discover_modules, all_extra_settings_keys
-
-# Default frame size when no detector module loaded; detector module can override in _build_ui
-DEFAULT_FRAME_W = 2400
-DEFAULT_FRAME_H = 2400
-# Master darks saved in app/darks/, flats in app/flats/, bad pixel maps (TIFF review) in app/pixelmaps/
-# Default folder for open/save file dialogs when no last path is stored
-DARK_DIR = pathlib.Path(__file__).resolve().parent / "darks"
-FLAT_DIR = pathlib.Path(__file__).resolve().parent / "flats"
-PIXELMAPS_DIR = pathlib.Path(__file__).resolve().parent / "pixelmaps"
-CAPTURES_DIR = pathlib.Path(__file__).resolve().parent / "captures"
-LAST_CAPTURED_DARK_NAME = "last_captured_dark.npy"
-LAST_CAPTURED_FLAT_NAME = "last_captured_flat.npy"
-INTEGRATION_CHOICES = ["0.5 s", "1 s", "2 s", "5 s", "10 s", "15 s", "20 s"]
-DARK_STACK_DEFAULT = 20  # default frames for dark/flat stacking (slider 1-50)
-# Max distance to auto-apply dark/flat: time_diff (s) + gain_diff/100; if nearest exceeds this, show "too far" in status
-DARK_FLAT_MATCH_THRESHOLD = 1.0
-HIST_MIN_12BIT = 0.0
-HIST_MAX_12BIT = 4095.0
-
-def _dark_dir(camera_name):
-    """Base directory for darks for this camera (subfolder under DARK_DIR)."""
-    return DARK_DIR / (camera_name or "default")
-
-def _flat_dir(camera_name):
-    """Base directory for flats for this camera."""
-    return FLAT_DIR / (camera_name or "default")
-
-def _pixelmaps_dir(camera_name):
-    """Base directory for pixel maps (TIFF review images) for this camera."""
-    return PIXELMAPS_DIR / (camera_name or "default")
-
-def _dark_path(integration_time_seconds: float, gain: int, width: int, height: int, camera_name) -> pathlib.Path:
-    """Path for a specific dark file: darks/<camera>/dark_{time}_{gain}_{width}x{height}.npy"""
-    return _dark_dir(camera_name) / f"dark_{integration_time_seconds}_{gain}_{width}x{height}.npy"
-
-def _flat_path(integration_time_seconds: float, gain: int, width: int, height: int, camera_name) -> pathlib.Path:
-    """Path for a specific flat file: flats/<camera>/flat_{time}_{gain}_{width}x{height}.npy"""
-    return _flat_dir(camera_name) / f"flat_{integration_time_seconds}_{gain}_{width}x{height}.npy"
-
-# Filename patterns: with resolution dark_1.5_100_1920x1080.npy; legacy dark_1.5_100.npy, dark_1.5.npy
-_DARK_FNAME_RE = re.compile(r"^dark_([\d.]+)_(\d+)_(\d+)x(\d+)\.npy$")
-_DARK_LEGACY_RE = re.compile(r"^dark_([\d.]+)_(\d+)\.npy$")
-_DARK_LEGACY_T_RE = re.compile(r"^dark_([\d.]+)\.npy$")
-_FLAT_FNAME_RE = re.compile(r"^flat_([\d.]+)_(\d+)_(\d+)x(\d+)\.npy$")
-_FLAT_LEGACY_RE = re.compile(r"^flat_([\d.]+)_(\d+)\.npy$")
-_FLAT_LEGACY_T_RE = re.compile(r"^flat_([\d.]+)\.npy$")
-
-def _distance_time_gain(t1: float, g1: int, t2: float, g2: int) -> float:
-    """Distance for nearest-match: time diff (s) + gain diff/100."""
-    return abs(t1 - t2) + abs(g1 - g2) / 100.0
-
-def _find_nearest_dark(camera_name, time_seconds: float, gain: int, width: int, height: int):
-    """Return (path, distance, (t, g)) for nearest dark matching resolution, or (None, inf, None)."""
-    def scan_dir(base_path):
-        candidates = []
-        if not base_path.exists():
-            return candidates
-        for p in base_path.glob("dark_*.npy"):
-            m = _DARK_FNAME_RE.match(p.name)
-            if m:
-                tw, gw, w, h = float(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
-                if width > 0 and height > 0 and (w != width or h != height):
-                    continue
-                candidates.append((p, (tw, gw)))
-            else:
-                m = _DARK_LEGACY_RE.match(p.name)
-                if m:
-                    t, g = float(m.group(1)), int(m.group(2))
-                    candidates.append((p, (t, g)))
-                else:
-                    m = _DARK_LEGACY_T_RE.match(p.name)
-                    if m:
-                        candidates.append((p, (float(m.group(1)), 0)))
-        return candidates
-    all_c = scan_dir(_dark_dir(camera_name)) + scan_dir(DARK_DIR)
-    best_path, best_dist, best_tg = None, math.inf, None
-    for p, (t, g) in all_c:
-        d = _distance_time_gain(time_seconds, gain, t, g)
-        if d < best_dist:
-            best_dist, best_path, best_tg = d, p, (t, g)
-    return best_path, best_dist, best_tg
-
-def _find_nearest_flat(camera_name, time_seconds: float, gain: int, width: int, height: int):
-    """Return (path, distance, (t, g)) for nearest flat matching resolution, or (None, inf, None)."""
-    def scan_dir(base_path):
-        candidates = []
-        if not base_path.exists():
-            return candidates
-        for p in base_path.glob("flat_*.npy"):
-            m = _FLAT_FNAME_RE.match(p.name)
-            if m:
-                tw, gw, w, h = float(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
-                if width > 0 and height > 0 and (w != width or h != height):
-                    continue
-                candidates.append((p, (tw, gw)))
-            else:
-                m = _FLAT_LEGACY_RE.match(p.name)
-                if m:
-                    t, g = float(m.group(1)), int(m.group(2))
-                    candidates.append((p, (t, g)))
-                else:
-                    m = _FLAT_LEGACY_T_RE.match(p.name)
-                    if m:
-                        candidates.append((p, (float(m.group(1)), 0)))
-        return candidates
-    all_c = scan_dir(_flat_dir(camera_name)) + scan_dir(FLAT_DIR)
-    best_path, best_dist, best_tg = None, math.inf, None
-    for p, (t, g) in all_c:
-        d = _distance_time_gain(time_seconds, gain, t, g)
-        if d < best_dist:
-            best_dist, best_path, best_tg = d, p, (t, g)
-    return best_path, best_dist, best_tg
-
-# Display size is set from settings (disp_scale) at runtime; see _build_ui and _frame_to_texture
+from ui.constants import (
+    DEFAULT_FRAME_W,
+    DEFAULT_FRAME_H,
+    DARK_DIR,
+    FLAT_DIR,
+    PIXELMAPS_DIR,
+    CAPTURES_DIR,
+    LAST_CAPTURED_DARK_NAME,
+    LAST_CAPTURED_FLAT_NAME,
+    INTEGRATION_CHOICES,
+    DARK_STACK_DEFAULT,
+    DARK_FLAT_MATCH_THRESHOLD,
+    HIST_MIN_12BIT,
+    HIST_MAX_12BIT,
+    dark_dir,
+    flat_dir,
+    pixelmaps_dir,
+    dark_path,
+    flat_path,
+    find_nearest_dark,
+    find_nearest_flat,
+)
+from ui import dark_flat as ui_dark_flat
+from ui import settings as ui_settings
+from ui import pipeline as ui_pipeline
+from ui import display as ui_display
+from ui import file_ops as ui_file_ops
+from ui import build_ui as ui_build_ui
 
 
 class XrayGUI:
@@ -266,6 +177,9 @@ class XrayGUI:
 
         # Image viewport (zoom and pan) - will be initialized after UI is built
         self.image_viewport = None
+        # Histogram zoom: when set, override axis limits in _paint_texture_from_frame
+        self._hist_zoom_lo = None
+        self._hist_zoom_hi = None
 
         # Discover modules first so we can load/save their settings
         self._discovered_modules = discover_modules()
@@ -335,19 +249,11 @@ class XrayGUI:
 
     def _get_file_dialog_default_path(self) -> str:
         """Directory to open file dialogs in; defaults to app/captures if none saved or invalid."""
-        p = pathlib.Path(getattr(self, "_last_file_dialog_dir", "") or str(CAPTURES_DIR))
-        if not p.is_dir():
-            p = CAPTURES_DIR
-        p.mkdir(parents=True, exist_ok=True)
-        return str(p)
+        return ui_file_ops.get_file_dialog_default_path(self)
 
     def _get_default_tiff_filename(self) -> str:
         """Default TIFF save name: dd-mm-YYYY-{exposuretime}-{gain}-{integration count}.tif"""
-        date_str = datetime.now().strftime("%d-%m-%Y")
-        integ_time = self._parse_integration_time(dpg.get_value("integ_time_combo")) if dpg.does_item_exist("integ_time_combo") else self.integration_time
-        gain = self._get_camera_gain()
-        n = int(dpg.get_value("integ_n_slider")) if dpg.does_item_exist("integ_n_slider") else self.integration_n
-        return f"{date_str}-{integ_time}-{gain}-{n}.tif"
+        return ui_file_ops.get_default_tiff_filename(self)
 
     def clear_frame_buffer(self):
         """Clear the integration buffer and display so the next submitted frame(s) are the only content. Call before submitting when loading a new image (e.g. Open Image module)."""
@@ -364,34 +270,15 @@ class XrayGUI:
 
     def submit_raw_frame(self, frame):
         """Called by camera module for each acquired frame. Runs dark/flat, corrections, buffer, display."""
-        self._push_frame(frame)
+        ui_pipeline.push_frame(self, frame)
 
     def _request_settings_save(self, scope: str = "full", debounce_s: float = None):
         """Schedule debounced settings save; full scope overrides window-only scope."""
-        if not getattr(self, "_extra_settings_keys", None):
-            return
-        if scope not in ("window", "full"):
-            scope = "full"
-        if debounce_s is None:
-            debounce_s = self._settings_save_debounce_s
-        self._settings_save_pending = True
-        if scope == "full" or self._settings_save_scope != "full":
-            self._settings_save_scope = scope
-        self._settings_save_deadline = time.monotonic() + max(0.0, float(debounce_s))
+        ui_settings.request_save(self, scope=scope, debounce_s=debounce_s)
 
     def _flush_pending_settings_save(self, force: bool = False):
         """Run pending debounced save on main thread when due (or immediately when force=True)."""
-        if not self._settings_save_pending:
-            return
-        if not force and time.monotonic() < self._settings_save_deadline:
-            return
-        scope = self._settings_save_scope
-        self._settings_save_pending = False
-        self._settings_save_scope = "window"
-        if scope == "window":
-            self._save_windowing_settings_now()
-        else:
-            self._save_settings_now()
+        ui_settings.flush_pending_save(self, force=force)
 
     def _save_settings(self):
         """Debounced full settings save request."""
@@ -399,60 +286,15 @@ class XrayGUI:
 
     def _save_settings_now(self):
         """Read current values from UI and persist to disk immediately. No-op if UI not built yet."""
-        if not getattr(self, "_extra_settings_keys", None):
-            return
-        # Sync module checkboxes into _module_enabled (in case callback ran before DPG updated)
-        for m in self._discovered_modules:
-            tag = f"load_module_cb_{m['name']}"
-            if dpg.does_item_exist(tag):
-                self._module_enabled[m["name"]] = bool(dpg.get_value(tag))
-        # Build dict with module enable state first (no other DPG) so it always persists
-        s = {}
-        for m in self._discovered_modules:
-            s[f"load_{m['name']}_module"] = self._module_enabled.get(m["name"], False)
-        try:
-            if not dpg.does_item_exist("acq_mode_combo"):
-                save_settings(s, extra_keys=self._extra_settings_keys)
-                return
-            s["acq_mode"] = dpg.get_value("acq_mode_combo")
-            s["integ_time"] = dpg.get_value("integ_time_combo")
-            s["integ_n"] = int(dpg.get_value("integ_n_slider"))
-            s["win_min"] = float(dpg.get_value("win_min_drag"))
-            s["win_max"] = float(dpg.get_value("win_max_drag"))
-            s["hist_eq"] = dpg.get_value("hist_eq_cb")
-            s["disp_scale"] = self.disp_scale
-            s["last_file_dialog_dir"] = getattr(self, "_last_file_dialog_dir", "") or ""
-            # Each module contributes its own settings (gui passed so modules can read DPG or fallback to gui state)
-            for m in self._discovered_modules:
-                try:
-                    mod = __import__(m["import_path"], fromlist=["get_settings_for_save"])
-                    get_save = getattr(mod, "get_settings_for_save", None)
-                    if callable(get_save):
-                        for k, v in get_save(self).items():
-                            s[k] = v
-                except Exception:
-                    pass
-        except Exception:
-            pass  # s already has module enable state
-        save_settings(s, extra_keys=self._extra_settings_keys)
+        ui_settings.save_settings_now(self)
 
     def _save_windowing_settings_fast(self):
-        """
-        Debounced save request for lightweight windowing-only settings.
-        Used by histogram/window callbacks to avoid expensive module sweeps.
-        """
+        """Debounced save request for lightweight windowing-only settings."""
         self._request_settings_save(scope="window")
 
     def _save_windowing_settings_now(self):
         """Persist only lightweight windowing settings immediately."""
-        if not getattr(self, "_extra_settings_keys", None):
-            return
-        s = {
-            "win_min": float(self.win_min),
-            "win_max": float(self.win_max),
-            "hist_eq": bool(self.hist_eq),
-        }
-        save_settings(s, extra_keys=self._extra_settings_keys)
+        ui_settings.save_windowing_now(self)
 
     def _request_window_refresh(self):
         """Schedule one redraw on next render tick (avoids callback storm backlog)."""
@@ -460,37 +302,7 @@ class XrayGUI:
 
     def _get_current_settings_dict(self):
         """Build the same dict as _save_settings would persist (for saving as profile). Returns dict."""
-        if not getattr(self, "_extra_settings_keys", None):
-            return {}
-        s = {}
-        for m in self._discovered_modules:
-            tag = f"load_module_cb_{m['name']}"
-            if dpg.does_item_exist(tag):
-                self._module_enabled[m["name"]] = bool(dpg.get_value(tag))
-        for m in self._discovered_modules:
-            s[f"load_{m['name']}_module"] = self._module_enabled.get(m["name"], False)
-        try:
-            if not dpg.does_item_exist("acq_mode_combo"):
-                return s
-            s["acq_mode"] = dpg.get_value("acq_mode_combo")
-            s["integ_time"] = dpg.get_value("integ_time_combo")
-            s["integ_n"] = int(dpg.get_value("integ_n_slider"))
-            s["win_min"] = float(dpg.get_value("win_min_drag"))
-            s["win_max"] = float(dpg.get_value("win_max_drag"))
-            s["hist_eq"] = dpg.get_value("hist_eq_cb")
-            s["disp_scale"] = self.disp_scale
-            for m in self._discovered_modules:
-                try:
-                    mod = __import__(m["import_path"], fromlist=["get_settings_for_save"])
-                    get_save = getattr(mod, "get_settings_for_save", None)
-                    if callable(get_save):
-                        for k, v in get_save(self).items():
-                            s[k] = v
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        return s
+        return ui_settings.get_current_settings_dict(self)
 
     # ── Dark field persistence (per camera, time, gain; nearest-match load) ────
 
@@ -505,409 +317,82 @@ class XrayGUI:
 
     def _load_dark_field(self):
         """Load nearest master dark for current integration time, gain and resolution (within threshold)."""
-        gain = self._get_camera_gain()
-        cam = self.camera_module_name
-        w, h = getattr(self, "frame_width", 0), getattr(self, "frame_height", 0)
-        path, dist, tg = _find_nearest_dark(cam, self.integration_time, gain, w, h)
-        self._dark_loaded_time_gain = None
-        self._dark_nearest_time_gain = None
-        if path is not None and dist <= DARK_FLAT_MATCH_THRESHOLD:
-            try:
-                loaded = np.load(path).astype(np.float32)
-                if w > 0 and h > 0 and (loaded.shape[0] != h or loaded.shape[1] != w):
-                    self.dark_field = None
-                else:
-                    self.dark_field = loaded
-                    self._dark_loaded_time_gain = tg
-            except Exception:
-                self.dark_field = None
-        else:
-            self.dark_field = None
-            if tg is not None:
-                self._dark_nearest_time_gain = tg
-                self._status_msg = f"No dark within range (nearest {tg[0]}s @ {tg[1]})"
+        ui_dark_flat.load_dark_field(self)
 
     def _save_dark_field(self):
         """Save master dark for current integration time, gain and resolution in camera subfolder."""
-        gain = self._get_camera_gain()
-        cam = self.camera_module_name
-        height, width = self.dark_field.shape[0], self.dark_field.shape[1]
-        base = _dark_dir(cam)
-        base.mkdir(parents=True, exist_ok=True)
-        path = _dark_path(self.integration_time, gain, width, height, cam)
-        np.save(path, self.dark_field)
-        shutil.copy2(path, base / LAST_CAPTURED_DARK_NAME)
-        arr = self.dark_field.astype(np.float32)
-        try:
-            import tifffile
-            tifffile.imwrite(path.with_suffix(".tif"), arr, photometric="minisblack", compression=None)
-            shutil.copy2(path.with_suffix(".tif"), base / "last_captured_dark.tif")
-        except Exception:
-            pass
-        # So status shows the just-saved (time, gain) without reloading
-        self._dark_loaded_time_gain = (self.integration_time, gain)
-        self._dark_nearest_time_gain = None
+        ui_dark_flat.save_dark_field(self)
 
     def _load_flat_field(self):
         """Load nearest master flat for current integration time, gain and resolution (within threshold)."""
-        gain = self._get_camera_gain()
-        cam = self.camera_module_name
-        w, h = getattr(self, "frame_width", 0), getattr(self, "frame_height", 0)
-        path, dist, tg = _find_nearest_flat(cam, self.integration_time, gain, w, h)
-        self._flat_loaded_time_gain = None
-        self._flat_nearest_time_gain = None
-        if path is not None and dist <= DARK_FLAT_MATCH_THRESHOLD:
-            try:
-                loaded = np.load(path).astype(np.float32)
-                if w > 0 and h > 0 and (loaded.shape[0] != h or loaded.shape[1] != w):
-                    self.flat_field = None
-                else:
-                    self.flat_field = loaded
-                    self._flat_loaded_time_gain = tg
-            except Exception:
-                self.flat_field = None
-        else:
-            self.flat_field = None
-            if tg is not None:
-                self._flat_nearest_time_gain = tg
-                self._status_msg = f"No flat within range (nearest {tg[0]}s @ {tg[1]})"
+        ui_dark_flat.load_flat_field(self)
 
     def _save_flat_field(self):
         """Save master flat for current integration time, gain and resolution in camera subfolder."""
-        gain = self._get_camera_gain()
-        cam = self.camera_module_name
-        height, width = self.flat_field.shape[0], self.flat_field.shape[1]
-        base = _flat_dir(cam)
-        base.mkdir(parents=True, exist_ok=True)
-        path = _flat_path(self.integration_time, gain, width, height, cam)
-        np.save(path, self.flat_field)
-        shutil.copy2(path, base / LAST_CAPTURED_FLAT_NAME)
-        arr = self.flat_field.astype(np.float32)
-        try:
-            import tifffile
-            tifffile.imwrite(path.with_suffix(".tif"), arr, photometric="minisblack", compression=None)
-            shutil.copy2(path.with_suffix(".tif"), base / "last_captured_flat.tif")
-        except Exception:
-            pass
-        # So status shows the just-saved (time, gain) without reloading
-        self._flat_loaded_time_gain = (self.integration_time, gain)
-        self._flat_nearest_time_gain = None
+        ui_dark_flat.save_flat_field(self)
 
     def _on_dark_flat_params_changed(self):
         """Call when integration time or gain changes so dark/flat nearest-match and status are refreshed."""
-        self._load_dark_field()
-        self._load_flat_field()
-        if dpg.does_item_exist("dark_status"):
-            dpg.set_value("dark_status", self._dark_status_text())
-        if dpg.does_item_exist("flat_status"):
-            dpg.set_value("flat_status", self._flat_status_text())
-        self._update_alteration_dark_flat_status()
+        ui_dark_flat.on_dark_flat_params_changed(self)
 
     def get_dark_dir(self):
         """Base directory for darks (and bad pixel map .npy) for the current camera. For use by api.get_dark_dir()."""
-        return _dark_dir(self.camera_module_name)
+        return dark_dir(self.camera_module_name)
 
     def get_pixelmaps_dir(self):
         """Base directory for pixel map TIFFs (review) for the current camera. For use by api.get_pixelmaps_dir()."""
-        return _pixelmaps_dir(self.camera_module_name)
+        return pixelmaps_dir(self.camera_module_name)
 
     def _dark_status_text(self):
         """Short status for dark: Loaded (Xs @ Y), None (nearest too far), or None."""
-        if self.dark_field is not None and self._dark_loaded_time_gain:
-            t, g = self._dark_loaded_time_gain
-            return f"Dark ({t}s @ {g}): Loaded"
-        if self._dark_nearest_time_gain:
-            t, g = self._dark_nearest_time_gain
-            return f"Dark: None (nearest {t}s @ {g} too far)"
-        return "Dark: None"
+        return ui_dark_flat.dark_status_text(self)
 
     def _flat_status_text(self):
-        if self.flat_field is not None and self._flat_loaded_time_gain:
-            t, g = self._flat_loaded_time_gain
-            return f"Flat ({t}s @ {g}): Loaded"
-        if self._flat_nearest_time_gain:
-            t, g = self._flat_nearest_time_gain
-            return f"Flat: None (nearest {t}s @ {g} too far)"
-        return "Flat: None"
+        """Short status for flat."""
+        return ui_dark_flat.flat_status_text(self)
 
     # ── Frame pipeline (called by camera module via submit_raw_frame) ─────
 
-    # First pipeline_slot used for "distortion" (pincushion, mustache, autocrop) for live preview
-    DISTORTION_PREVIEW_SLOT = 450
+    DISTORTION_PREVIEW_SLOT = 450  # First pipeline_slot used for distortion (pincushion, mustache, autocrop) live preview
 
     def _frame_log_signature(self, frame: np.ndarray):
-        arr = np.asarray(frame)
-        shape = tuple(arr.shape)
-        dtype = str(arr.dtype)
-        if arr.size == 0:
-            return shape, dtype, [0.0]
-        flat = arr.reshape(-1)
-        idx = np.linspace(0, flat.size - 1, num=min(9, flat.size), dtype=np.int64)
-        vals = [float(flat[int(i)]) for i in idx]
-        return shape, dtype, vals
+        return ui_pipeline.frame_log_signature(self, frame)
 
     def _log_pipeline_step(self, context: str, token: int, slot: int, module_name: str, frame_in, frame_out):
-        """Compact per-step pipeline diagnostics for module manipulations."""
-        try:
-            in_shape, in_dtype, in_vals = self._frame_log_signature(frame_in)
-            out_shape, out_dtype, out_vals = self._frame_log_signature(frame_out)
-            if len(in_vals) == len(out_vals):
-                sample_mad = float(np.mean(np.abs(np.asarray(out_vals) - np.asarray(in_vals))))
-            else:
-                sample_mad = float("nan")
-            changed = (in_shape != out_shape) or (in_dtype != out_dtype) or (sample_mad > 1e-9)
-            print(
-                f"[Pipeline][{context}] token={token} slot={slot} module={module_name} "
-                f"in={in_shape}/{in_dtype} out={out_shape}/{out_dtype} "
-                f"changed={changed} sample_mad={sample_mad:.6g}",
-                flush=True,
-            )
-        except Exception as e:
-            print(
-                f"[Pipeline][{context}] token={token} slot={slot} module={module_name} "
-                f"log-error={e}",
-                flush=True,
-            )
+        ui_pipeline.log_pipeline_step(self, context, token, slot, module_name, frame_in, frame_out)
 
     def _push_frame(self, frame):
-        """Apply alteration pipeline (dark, flat, etc.), then banding, dead pixel, distortion, crop; buffer and signal.
-        When _capture_max_slot is set, run only steps with slot < _capture_max_slot and collect result (for dark/flat capture)."""
-        max_slot = getattr(self, "_capture_max_slot", None)
-        pipeline = getattr(self, "_alteration_pipeline", [])
-        self._pipeline_frame_token += 1
-        frame_token = self._pipeline_frame_token
-
-        if max_slot is not None:
-            # Run only steps with slot < max_slot (e.g. 100 for dark = raw; 200 for flat = dark applied)
-            for slot, module_name, step in pipeline:
-                if slot >= max_slot:
-                    break
-                self._pipeline_module_cache[module_name] = {
-                    "token": frame_token,
-                    "slot": slot,
-                    "frame": frame.copy(),
-                }
-                frame_in = frame
-                try:
-                    frame = step(frame, self)
-                except Exception as e:
-                    print(
-                        f"[Pipeline][capture] token={frame_token} slot={slot} module={module_name} "
-                        f"step-error={e}",
-                        flush=True,
-                    )
-                    raise
-                self._log_pipeline_step("capture", frame_token, slot, module_name, frame_in, frame)
-            with self.frame_lock:
-                self._capture_frames_collect.append(frame.copy())
-                if len(self._capture_frames_collect) >= getattr(self, "_capture_n", 0):
-                    self._capture_frames_ready.set()
-                # Show progressing stack (running average) in main view during dark/flat capture
-                self._pending_preview_frame = np.mean(
-                    self._capture_frames_collect, axis=0
-                ).astype(np.float32).copy()
-            return
-
-        frame_before_distortion = None
-        for slot, module_name, step in pipeline:
-            if slot >= self.DISTORTION_PREVIEW_SLOT and frame_before_distortion is None:
-                frame_before_distortion = frame.copy()
-            self._pipeline_module_cache[module_name] = {
-                "token": frame_token,
-                "slot": slot,
-                "frame": frame.copy(),
-            }
-            frame_in = frame
-            try:
-                frame = step(frame, self)
-            except Exception as e:
-                print(
-                    f"[Pipeline][live] token={frame_token} slot={slot} module={module_name} "
-                    f"step-error={e}",
-                    flush=True,
-                )
-                raise
-            self._log_pipeline_step("live", frame_token, slot, module_name, frame_in, frame)
-
-        with self.frame_lock:
-            if frame_before_distortion is not None:
-                self._frame_before_distortion = frame_before_distortion
-            self.raw_frame = frame
-            self.frame_buffer.append(frame)
-            if len(self.frame_buffer) > self.integration_n:
-                self.frame_buffer = self.frame_buffer[-self.integration_n:]
-            self._update_integrated_display()
-
-        self.frame_count += 1
-        now = time.time()
-        self._fps_count += 1
-        dt = now - self._fps_time
-        if dt >= 1.0:
-            self.fps = self._fps_count / dt
-            self._fps_count = 0
-            self._fps_time = now
-
-        self.new_frame_ready.set()
-
-    # ── Generic pipeline state helpers (for manual-alteration modules) ─────
+        """Apply alteration pipeline; buffer and signal. Delegates to ui.pipeline."""
+        ui_pipeline.push_frame(self, frame)
 
     def _get_module_incoming_image(self, module_name: str):
-        item = self._pipeline_module_cache.get(module_name)
-        if not item:
-            return None
-        frame = item.get("frame")
-        return frame.copy() if frame is not None else None
+        return ui_pipeline.get_module_incoming_image(self, module_name)
 
     def _incoming_frame_for_module(self, module_name: str, frame: np.ndarray, use_cached: bool = False):
-        if use_cached:
-            cached = self._get_module_incoming_image(module_name)
-            if cached is not None:
-                return cached
-        return frame
+        return ui_pipeline.incoming_frame_for_module(self, module_name, frame, use_cached)
 
     def _get_module_incoming_token(self, module_name: str):
-        item = self._pipeline_module_cache.get(module_name)
-        if not item:
-            return None
-        return int(item.get("token", 0))
+        return ui_pipeline.get_module_incoming_token(self, module_name)
 
     def _continue_pipeline_from_slot(self, frame: np.ndarray, start_slot_exclusive: int):
-        """Run pipeline from slot > start_slot_exclusive. Updates _pipeline_module_cache for each
-        module run so get_module_incoming_image() reflects the last manual or live run (e.g. after
-        Revert at X, downstream modules see incoming = frame that skipped X)."""
-        out = np.asarray(frame, dtype=np.float32)
-        token = int(getattr(self, "_pipeline_frame_token", 0))
-        for slot, _module_name, step in getattr(self, "_alteration_pipeline", []):
-            if slot <= start_slot_exclusive:
-                continue
-            # Cache this module's incoming so later Apply/Revert see correct upstream state
-            self._pipeline_module_cache[_module_name] = {
-                "token": token,
-                "slot": slot,
-                "frame": out.copy(),
-            }
-            frame_in = out
-            try:
-                out = step(out, self)
-            except Exception as e:
-                print(
-                    f"[Pipeline][continue] token={token} slot={slot} module={_module_name} "
-                    f"step-error={e}",
-                    flush=True,
-                )
-                raise
-            self._log_pipeline_step("continue", token, slot, _module_name, frame_in, out)
-        return out
+        return ui_pipeline.continue_pipeline_from_slot(self, frame, start_slot_exclusive)
 
     def _continue_pipeline_from_module(self, module_name: str, frame: np.ndarray):
-        slot = self._pipeline_module_slots.get(module_name, None)
-        if slot is None:
-            # Fallback in case slot map is stale/incomplete.
-            for s, n, _pf in getattr(self, "_alteration_pipeline", []):
-                if n == module_name:
-                    slot = s
-                    self._pipeline_module_slots[module_name] = s
-                    break
-        if slot is None:
-            # Do not silently skip all downstream modules; run full pipeline and log warning.
-            print(
-                f"[Pipeline][manual-continue] module={module_name} not in slot map; "
-                f"falling back to full pipeline continuation",
-                flush=True,
-            )
-            slot = -1
-        downstream = [n for s, n, _pf in getattr(self, "_alteration_pipeline", []) if s > slot]
-        print(
-            f"[Pipeline][manual-continue] module={module_name} start_slot={slot} downstream={downstream}",
-            flush=True,
-        )
-        return self._continue_pipeline_from_slot(frame, slot)
+        return ui_pipeline.continue_pipeline_from_module(self, module_name, frame)
 
     def _output_manual_from_module(self, module_name: str, frame: np.ndarray):
-        out = self._continue_pipeline_from_module(module_name, frame)
-        with self.frame_lock:
-            self.display_frame = out.copy()
-        self._display_mode = "live"
-        self._paint_texture_from_frame(out)
-        self._force_image_refresh()
-        print(
-            f"[Pipeline][manual-output] module={module_name} mode=live painted=1",
-            flush=True,
-        )
-        return out
+        return ui_pipeline.output_manual_from_module(self, module_name, frame)
 
     def _outgoing_frame_from_module(self, module_name: str, frame: np.ndarray):
-        # Reserved extension point for module-level output hooks/diagnostics.
-        return frame
+        return ui_pipeline.outgoing_frame_from_module(self, module_name, frame)
 
     def request_n_frames_processed_up_to_slot(
         self, n: int, max_slot: int, timeout_seconds: float = 300.0, dark_capture: bool = False
     ):
-        """
-        Run camera capture_n for N frames, running the pipeline only for steps with slot < max_slot,
-        collect the results and return their average (float32). Used by dark/flat modules for capture.
-        dark_capture=True skips turning on the beam (for dark reference). Returns None on timeout/error.
-        """
-        if self.camera_module is None or not self.camera_module.is_connected():
-            return None
-        if self.acq_mode != "idle":
-            return None
-        self._capture_max_slot = max_slot
-        self._capture_frames_collect = []
-        self._capture_n = n
-        self._capture_frames_ready.clear()
-        self._capture_skip_beam = dark_capture
-        self.integration_n = n
-        self.acq_stop.clear()
-        self._progress = 0.0
-        self.clear_frame_buffer()
-
-        # For flat capture: turn on beam supply (with cancel support). Dark capture skips this.
-        if not dark_capture:
-            beam = getattr(self, "beam_supply", None)
-            if beam is not None and beam.wants_auto_on_off() and not beam.is_connected():
-                if not getattr(self, "workflow_keep_beam_on", False):
-                    self._status_msg = "Auto On/Off enabled but supply not connected"
-                    return None
-            if beam is not None and beam.wants_auto_on_off() and beam.is_connected():
-                if not getattr(self, "workflow_keep_beam_on", False):
-                    self._progress_text = "Waiting for supply... (click Stop to cancel)"
-                    if not beam.turn_on_and_wait_ready(should_cancel=lambda: self.acq_stop.is_set()):
-                        self._progress_text = ""
-                        self._capture_max_slot = None
-                        self._capture_frames_collect = []
-                        self._capture_n = 0
-                        self._capture_skip_beam = False
-                        if self.acq_stop.is_set():
-                            self._status_msg = "Acquisition cancelled"
-                        else:
-                            self._status_msg = "Supply did not become ready (timeout or fault)"
-                        return None
-                    self._progress_text = ""
-
-        self.acq_mode = "capture_n"
-        self.camera_module.start_acquisition(self)
-        t0 = time.time()
-        while not self._capture_frames_ready.wait(timeout=0.2):
-            if self.acq_stop.is_set():
-                self._stop_acquisition()
-                break
-            if (time.time() - t0) > timeout_seconds:
-                self._stop_acquisition()
-                break
-        # Wait for camera thread to finish so we don't clear capture state too early (check cancel too)
-        while self.acq_mode != "idle" and (time.time() - t0) < timeout_seconds + 5:
-            if self.acq_stop.is_set():
-                break
-            time.sleep(0.05)
-        collected = getattr(self, "_capture_frames_collect", [])
-        self._capture_max_slot = None
-        self._capture_frames_collect = []
-        self._capture_n = 0
-        self._capture_skip_beam = False
-        if len(collected) < n:
-            return None
-        return np.mean(collected, axis=0).astype(np.float32)
+        """Run camera capture_n for N frames with pipeline up to max_slot; return average or None."""
+        return ui_pipeline.request_n_frames_processed_up_to_slot(
+            self, n, max_slot, timeout_seconds, dark_capture
+        )
 
     def _start_acquisition(self, mode):
         """Start acquisition; mode is 'single', 'dual', 'continuous', 'capture_n'."""
@@ -1024,148 +509,37 @@ class XrayGUI:
     # ── Display pipeline (main thread) ──────────────────────────────
 
     def _frame_to_texture(self, frame):
-        """Apply windowing and convert to RGBA float32 for DPG texture. Uses frame shape (handles cropped frames). Returns (data, disp_w, disp_h)."""
-        if self.hist_eq:
-            norm = self._histogram_equalize(frame)
-        else:
-            lo, hi = self.win_min, self.win_max
-            if hi <= lo:
-                hi = lo + 1
-            norm = (frame - lo) / (hi - lo)
-
-        norm = np.clip(norm, 0.0, 1.0).astype(np.float32)
-
-        # Display size from actual frame (so cropped frames work)
-        disp_h = frame.shape[0] // self.disp_scale
-        disp_w = frame.shape[1] // self.disp_scale
-        # Optional display downsampling (block mean) when disp_scale > 1
-        if self.disp_scale > 1:
-            norm = norm.reshape(disp_h, self.disp_scale, disp_w, self.disp_scale).mean(axis=(1, 3))
-
-        # Build RGBA (grayscale: R=G=B=val, A=1)
-        rgba = np.empty((disp_h, disp_w, 4), dtype=np.float32)
-        rgba[:, :, 0] = norm
-        rgba[:, :, 1] = norm
-        rgba[:, :, 2] = norm
-        rgba[:, :, 3] = 1.0
-        return rgba.ravel(), disp_w, disp_h
+        """Apply windowing and convert to RGBA float32 for DPG texture. Returns (data, disp_w, disp_h)."""
+        return ui_display.frame_to_texture(self, frame)
 
     def _scale_frame_to_fit(self, frame: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
-        """Scale frame to fit inside target_w x target_h (preserve aspect, letterbox). Return float32 (target_h, target_w) in 0–1."""
-        if target_w <= 0 or target_h <= 0:
-            return np.zeros((target_h, target_w), dtype=np.float32)
-        arr = np.asarray(frame, dtype=np.float32)
-        h, w = arr.shape[0], arr.shape[1]
-        if h <= 0 or w <= 0:
-            return np.zeros((target_h, target_w), dtype=np.float32)
-        scale = min(target_w / w, target_h / h)
-        out_w = max(1, int(round(w * scale)))
-        out_h = max(1, int(round(h * scale)))
-        yi = np.linspace(0, h - 1, out_h).astype(np.int32)
-        xi = np.linspace(0, w - 1, out_w).astype(np.int32)
-        small = arr[np.ix_(yi, xi)]
-        canvas = np.zeros((target_h, target_w), dtype=np.float32)
-        y0 = (target_h - out_h) // 2
-        x0 = (target_w - out_w) // 2
-        canvas[y0:y0 + out_h, x0:x0 + out_w] = small
-        lo, hi = float(np.min(canvas)), float(np.max(canvas))
-        if hi > lo:
-            canvas = (canvas - lo) / (hi - lo)
-        else:
-            canvas[:] = 0.5
-        return np.clip(canvas, 0.0, 1.0).astype(np.float32)
+        """Scale frame to fit inside target_w x target_h (preserve aspect, letterbox)."""
+        return ui_display.scale_frame_to_fit(self, frame, target_w, target_h)
 
     def _paint_preview_raw(self) -> None:
-        """Paint _preview_frame to main view with scale-to-fit and frame's own min/max (no histogram/windowing)."""
-        if self._preview_frame is None or self._preview_frame.size == 0 or self._texture_id is None:
-            return
-        disp_w = getattr(self, "_disp_w", 0)
-        disp_h = getattr(self, "_disp_h", 0)
-        if disp_w <= 0 or disp_h <= 0:
-            return
-        scaled = self._scale_frame_to_fit(self._preview_frame, disp_w, disp_h)
-        rgba = np.empty((disp_h, disp_w, 4), dtype=np.float32)
-        rgba[:, :, 0] = scaled
-        rgba[:, :, 1] = scaled
-        rgba[:, :, 2] = scaled
-        rgba[:, :, 3] = 1.0
-        dpg.set_value(self._texture_id, rgba.ravel().tolist())
-        self._force_image_refresh()
+        """Paint _preview_frame to main view with scale-to-fit (no histogram/windowing)."""
+        ui_display.paint_preview_raw(self)
 
     def _paint_preview_to_main_view(self, frame: np.ndarray, use_histogram: bool = True) -> None:
-        """Paint a frame to the main view. use_histogram=True: windowing/hist eq; False: raw (scale to fit, own min/max). Sets preview mode until clear."""
-        if frame is None or frame.size == 0 or self._texture_id is None:
-            return
-        self._main_view_preview_active = True
-        self._preview_frame = np.asarray(frame, dtype=np.float32).copy()
-        self._preview_use_histogram = use_histogram
-        if use_histogram:
-            self._paint_texture_from_frame(self._preview_frame)
-        else:
-            self._paint_preview_raw()
-        self._force_image_refresh()
+        """Paint a frame to the main view; sets preview mode until clear."""
+        ui_display.paint_preview_to_main_view(self, frame, use_histogram)
 
     def _clear_main_view_preview(self) -> None:
-        """Leave preview mode and repaint the normal display (live/raw/deconvolved)."""
-        self._main_view_preview_active = False
-        self._preview_frame = None
-        self._preview_use_histogram = True
-        self._refresh_texture_from_settings()
-        self._force_image_refresh()
+        """Leave preview mode and repaint the normal display."""
+        ui_display.clear_main_view_preview(self)
 
     @staticmethod
     def _histogram_equalize(img):
-        flat = img.flatten()
-        # Use the actual data range, not a fixed 0-4096
-        lo, hi = float(flat.min()), float(flat.max())
-        if hi <= lo:
-            return np.zeros_like(img)
-        # Map to 4096 bins within the data range
-        nbins = 4096
-        hist, bins = np.histogram(flat, bins=nbins, range=(lo, hi))
-        cdf = hist.cumsum().astype(np.float64)
-        cdf_max = cdf[-1]
-        if cdf_max == 0:
-            return np.zeros_like(img)
-        cdf_norm = cdf / cdf_max
-        # Map pixel values to bin indices
-        indices = np.clip(((img - lo) / (hi - lo) * (nbins - 1)), 0, nbins - 1).astype(np.int32)
-        return cdf_norm[indices].astype(np.float32)
+        """Histogram equalization for display. Delegates to ui.display."""
+        return ui_display.histogram_equalize(img)
 
     def _update_display(self):
         """Called from main thread when new_frame_ready is set. Only updates texture when showing live."""
-        if self._main_view_preview_active:
-            return
-        if self._display_mode != "live":
-            return
-        with self.frame_lock:
-            if self.display_frame is None:
-                return
-            frame = self.display_frame.copy()
-        self._paint_texture_from_frame(frame)
+        ui_display.update_display(self)
 
     def _refresh_distortion_preview(self):
-        """Re-run distortion+crop steps on the last pre-distortion frame and repaint (live preview when adjusting sliders)."""
-        if self._display_mode != "live":
-            return
-        with self.frame_lock:
-            if self._frame_before_distortion is None:
-                return
-            frame = self._frame_before_distortion.copy()
-        token = int(getattr(self, "_pipeline_frame_token", 0))
-        for _slot, _name, step in getattr(self, "_distortion_crop_pipeline", []):
-            frame_in = frame
-            try:
-                frame = step(frame, self)
-            except Exception as e:
-                print(
-                    f"[Pipeline][preview] token={token} slot={_slot} module={_name} "
-                    f"step-error={e}",
-                    flush=True,
-                )
-                raise
-            self._log_pipeline_step("preview", token, _slot, _name, frame_in, frame)
-        self._paint_texture_from_frame(frame)
+        """Re-run distortion+crop steps on the last pre-distortion frame and repaint."""
+        ui_display.refresh_distortion_preview(self)
 
     def _force_image_refresh(self):
         """Force the image widget to re-bind/redraw with the current texture (e.g. after Apply/Revert)."""
@@ -1173,93 +547,22 @@ class XrayGUI:
 
     def _get_display_max_value(self) -> float:
         """Max display/windowing value from current camera bit depth (12/14/16-bit)."""
-        return self.api.get_display_max_value()
+        return ui_display.get_display_max_value(self)
 
     def _clamp_window_bounds(self, lo: float, hi: float):
-        dmin, dmax = 0.0, self._get_display_max_value()
-        lo = float(max(dmin, min(lo, dmax)))
-        hi = float(max(dmin, min(hi, dmax)))
-        if hi <= lo:
-            hi = min(dmax, lo + 1.0)
-            if hi <= lo:
-                lo = max(dmin, hi - 1.0)
-        return lo, hi
+        return ui_display.clamp_window_bounds(self, lo, hi)
 
     def _get_histogram_analysis_pixels(self, frame: np.ndarray) -> np.ndarray:
-        """Pixels used for histogram/auto-window stats (can ignore separator-clipped background)."""
-        flat = np.asarray(frame, dtype=np.float32).reshape(-1)
-        flat = flat[np.isfinite(flat)]
-        if flat.size == 0:
-            return flat
-        use_bgsep_mask = bool(getattr(self, "_bgsep_hist_ignore", True)) and bool(
-            getattr(self, "_bgsep_hist_active", False)
-        )
-        cutoff = getattr(self, "_bgsep_hist_cutoff", None)
-        if use_bgsep_mask and cutoff is not None and np.isfinite(float(cutoff)):
-            masked = flat[flat < float(cutoff)]
-            # Fallback if mask becomes too sparse.
-            if masked.size >= max(128, int(0.01 * flat.size)):
-                return masked
-        return flat
+        """Pixels used for histogram/auto-window stats."""
+        return ui_display.get_histogram_analysis_pixels(self, frame)
 
     def _paint_texture_from_frame(self, frame: np.ndarray):
-        """Update texture and histogram from a given frame (used for live, Apply, Revert). Recreates texture when frame size changes (e.g. after crop)."""
-        texture_data, disp_w, disp_h = self._frame_to_texture(frame)
-        if (disp_w, disp_h) != (self._disp_w, self._disp_h):
-            # Frame size changed (e.g. autocrop); recreate texture and bind to image
-            with dpg.texture_registry():
-                new_id = dpg.add_dynamic_texture(width=disp_w, height=disp_h, default_value=texture_data)
-            dpg.configure_item("main_image", texture_tag=new_id)
-            dpg.delete_item(self._texture_id)
-            self._texture_id = new_id
-            self._disp_w, self._disp_h = disp_w, disp_h
-            if self.image_viewport is not None:
-                self.image_viewport.aspect_ratio = disp_w / disp_h if disp_h else 1.0
-        else:
-            dpg.set_value(self._texture_id, texture_data)
-        flat = self._get_histogram_analysis_pixels(frame)
-        frame_lo, frame_hi = float(flat.min()), float(flat.max())
-        if not (np.isfinite(frame_lo) and np.isfinite(frame_hi)) or frame_hi <= frame_lo:
-            frame_lo, frame_hi = 0.0, self._get_display_max_value()
-        frame_lo, frame_hi = self._clamp_window_bounds(frame_lo, frame_hi)
-        # Keep histogram axis and drag lines in the same visible range:
-        # include both data extent and current windowing extent.
-        axis_lo = min(frame_lo, float(self.win_min))
-        axis_hi = max(frame_hi, float(self.win_max))
-        axis_lo, axis_hi = self._clamp_window_bounds(axis_lo, axis_hi)
-        hist_vals, hist_edges = np.histogram(flat, bins=256, range=(axis_lo, axis_hi))
-        peak = hist_vals.max()
-        if peak > 0:
-            hist_norm = (hist_vals / peak).tolist()
-        else:
-            hist_norm = [0.0] * len(hist_vals)
-        hist_centers = (hist_edges[:-1] + hist_edges[1:]) / 2
-        zeros = [0] * len(hist_centers)
-        dpg.set_value("hist_series", [hist_centers.tolist(), hist_norm, zeros])
-        dpg.set_axis_limits_constraints("hist_x", axis_lo, axis_hi)
-        dpg.set_axis_limits("hist_x", axis_lo, axis_hi)
-        dpg.set_axis_limits("hist_y", 0.0, 1.05)
+        """Update texture and histogram from a given frame (used for live, Apply, Revert)."""
+        ui_display.paint_texture_from_frame(self, frame)
 
     def _refresh_texture_from_settings(self):
         """Re-render current view with new windowing settings (live, raw, deconvolved, or preview)."""
-        if self._main_view_preview_active and self._preview_frame is not None:
-            if getattr(self, "_preview_use_histogram", True):
-                self._paint_texture_from_frame(self._preview_frame.copy())
-            else:
-                self._paint_preview_raw()
-            return
-        if self._display_mode == "live":
-            with self.frame_lock:
-                if self.display_frame is None:
-                    return
-                frame = self.display_frame.copy()
-        elif self._display_mode == "raw" and self._deconv_raw_frame is not None:
-            frame = self._deconv_raw_frame.copy()
-        elif self._display_mode == "deconvolved" and self._deconv_result is not None:
-            frame = self._deconv_result.copy()
-        else:
-            return
-        self._paint_texture_from_frame(frame)
+        ui_display.refresh_texture_from_settings(self)
 
     # ── Callbacks ───────────────────────────────────────────────────
 
@@ -1314,6 +617,8 @@ class XrayGUI:
         lo -= margin
         hi += margin
         self.win_min, self.win_max = self._clamp_window_bounds(lo, hi)
+        self._hist_zoom_lo = None
+        self._hist_zoom_hi = None
         # Nudge both lines slightly inward so they are not exactly on plot edges.
         inset = 10.0
         if (self.win_max - self.win_min) > (2.0 * inset + 1.0):
@@ -1431,7 +736,7 @@ class XrayGUI:
     def _cb_clear_dark(self, sender=None, app_data=None):
         gain = self._get_camera_gain()
         w, h = getattr(self, "frame_width", 0), getattr(self, "frame_height", 0)
-        path = _dark_path(self.integration_time, gain, w, h, self.camera_module_name)
+        path = dark_path(self.integration_time, gain, w, h, self.camera_module_name)
         self.dark_field = None
         self._dark_loaded_time_gain = None
         self._dark_nearest_time_gain = None
@@ -1464,7 +769,7 @@ class XrayGUI:
     def _cb_clear_flat(self, sender=None, app_data=None):
         gain = self._get_camera_gain()
         w, h = getattr(self, "frame_width", 0), getattr(self, "frame_height", 0)
-        path = _flat_path(self.integration_time, gain, w, h, self.camera_module_name)
+        path = flat_path(self.integration_time, gain, w, h, self.camera_module_name)
         self.flat_field = None
         self._flat_loaded_time_gain = None
         self._flat_nearest_time_gain = None
@@ -1545,171 +850,102 @@ class XrayGUI:
         return self._get_current_display_frame()
 
     def _cb_export_png(self, sender=None, app_data=None):
-        if self._get_export_frame() is None:
-            self._status_msg = "No frame to export"
-            return
-        dpg.configure_item("file_dialog", default_path=self._get_file_dialog_default_path())
-        dpg.show_item("file_dialog")
+        ui_file_ops.cb_export_png(self)
 
     def _cb_save_tiff(self, sender=None, app_data=None):
-        if self._get_export_frame() is None:
-            self._status_msg = "No frame to save"
-            return
-        dpg.configure_item("tiff_file_dialog", default_path=self._get_file_dialog_default_path(), default_filename=self._get_default_tiff_filename())
-        dpg.show_item("tiff_file_dialog")
+        ui_file_ops.cb_save_tiff(self)
 
     def _load_image_file_as_float32(self, path: str) -> np.ndarray:
         """Load TIFF or PNG as 2D float32, resized to current frame size. Raises on error."""
-        try:
-            import tifffile
-            arr = tifffile.imread(path)
-        except Exception:
-            from PIL import Image
-            arr = np.array(Image.open(path))
-        if arr is None or arr.size == 0:
-            raise ValueError("Empty or invalid image")
-        if arr.ndim == 3:
-            arr = arr[:, :, 0] if arr.shape[2] >= 1 else arr.squeeze()
-        if arr.ndim != 2:
-            arr = arr.squeeze()
-        arr = np.asarray(arr, dtype=np.float32)
-        h, w = getattr(self, "frame_height", DEFAULT_FRAME_H), getattr(self, "frame_width", DEFAULT_FRAME_W)
-        if arr.shape[0] != h or arr.shape[1] != w:
-            try:
-                from skimage.transform import resize
-                arr = resize(arr, (h, w), order=1, preserve_range=True).astype(np.float32)
-            except Exception:
-                from scipy.ndimage import zoom
-                zoom_h = h / arr.shape[0]
-                zoom_w = w / arr.shape[1]
-                arr = zoom(arr, (zoom_h, zoom_w), order=1)[:h, :w].astype(np.float32)
-        return arr
+        return ui_file_ops.load_image_file_as_float32(self, path)
 
     def _cb_file_open_image(self, sender=None, app_data=None):
-        dpg.configure_item("open_image_file_dialog", default_path=self._get_file_dialog_default_path())
-        dpg.show_item("open_image_file_dialog")
+        ui_file_ops.cb_file_open_image(self)
 
     def _cb_open_image_file_selected(self, sender, app_data):
-        if not app_data:
-            return
-        path = app_data.get("file_path_name", "")
-        if isinstance(path, (list, tuple)):
-            path = path[0] if path else ""
-        if not path:
-            return
-        try:
-            frame = self._load_image_file_as_float32(path)
-            self._file_preview_frame = frame
-            self._paint_preview_to_main_view(frame, use_histogram=True)
-            self._status_msg = f"Opened: {os.path.basename(path)}"
-            dir_path = os.path.dirname(path)
-            if dir_path and pathlib.Path(dir_path).is_dir():
-                self._last_file_dialog_dir = dir_path
-                self._save_settings()
-        except Exception as e:
-            self._status_msg = f"Open failed: {e}"
-            self._file_preview_frame = None
+        ui_file_ops.cb_open_image_file_selected(self, sender, app_data)
 
     def _cb_file_run_through_processing(self, sender=None, app_data=None):
-        if self._file_preview_frame is None:
-            self._status_msg = "Open an image first"
-            return
-        frame = self._file_preview_frame
-        self._clear_main_view_preview()
-        self.clear_frame_buffer()
-        self._push_frame(frame)
-        self._file_preview_frame = None
-        with self.frame_lock:
-            if self.display_frame is not None:
-                self._paint_texture_from_frame(self.display_frame.copy())
-        self._status_msg = "Processed; you can Save TIF"
+        ui_file_ops.cb_file_run_through_processing(self)
 
     def _cb_file_save_tiff(self, sender=None, app_data=None):
-        if self._get_export_frame() is None:
-            self._status_msg = "No frame to save (run an image through processing first)"
-            return
-        dpg.configure_item("tiff_file_dialog", default_path=self._get_file_dialog_default_path(), default_filename=self._get_default_tiff_filename())
-        dpg.show_item("tiff_file_dialog")
+        ui_file_ops.cb_file_save_tiff(self)
 
     def _cb_tiff_file_selected(self, sender, app_data):
-        filepath = app_data.get("file_path_name", "")
-        if not filepath:
-            return
-        if not filepath.lower().endswith((".tif", ".tiff")):
-            filepath += ".tif"
-        dir_path = os.path.dirname(filepath)
-        if dir_path and pathlib.Path(dir_path).is_dir():
-            self._last_file_dialog_dir = dir_path
-            self._save_settings()
-        frame = self._get_export_frame()
-        if frame is None:
-            self._status_msg = "No frame to save"
-            return
-        frame = frame.copy().astype(np.float32)
-        finite = np.isfinite(frame)
-        if not np.any(finite):
-            self._status_msg = "TIFF save failed: frame has no finite values"
-            return
-        lo = float(np.min(frame[finite]))
-        hi = float(np.max(frame[finite]))
-        if hi <= lo:
-            # Constant frame: map to black to avoid divide-by-zero.
-            arr16 = np.zeros(frame.shape, dtype=np.uint16)
-        else:
-            # Use full 16-bit range from actual frame data (no in-frame clipping).
-            safe = np.nan_to_num(frame, nan=lo, posinf=hi, neginf=lo)
-            scaled = (safe - lo) / (hi - lo)
-            arr16 = np.clip(np.rint(scaled * 65535.0), 0.0, 65535.0).astype(np.uint16)
-        try:
-            try:
-                import tifffile
-                tifffile.imwrite(filepath, arr16, photometric="minisblack", compression=None)
-            except ImportError:
-                from PIL import Image
-                img = Image.fromarray(arr16, mode="I;16")
-                img.save(filepath, compression=None)
-                self._status_msg = f"Saved TIFF (16-bit normalized, min={lo:.3f}, max={hi:.3f}): {filepath}"
-                return
-            self._status_msg = f"Saved TIFF (16-bit normalized, min={lo:.3f}, max={hi:.3f}): {filepath}"
-        except Exception as e:
-            self._status_msg = f"TIFF save failed: {e}"
+        ui_file_ops.cb_tiff_file_selected(self, sender, app_data)
 
     def _cb_file_selected(self, sender, app_data):
-        filepath = app_data.get("file_path_name", "")
-        if not filepath:
-            return
-        if not filepath.lower().endswith(".png"):
-            filepath += ".png"
-        dir_path = os.path.dirname(filepath)
-        if dir_path and pathlib.Path(dir_path).is_dir():
-            self._last_file_dialog_dir = dir_path
-            self._save_settings()
-        frame = self._get_export_frame()
-        if frame is None:
-            self._status_msg = "No frame to export"
-            return
-        frame = frame.copy()
-
-        # Apply current windowing
-        lo, hi = self.win_min, self.win_max
-        if hi <= lo:
-            hi = lo + 1
-        normed = np.clip((frame - lo) / (hi - lo), 0, 1)
-        img8 = (normed * 255).astype(np.uint8)
-
-        try:
-            from PIL import Image
-            Image.fromarray(img8, mode='L').save(filepath)
-            self._status_msg = f"Exported: {filepath}"
-        except Exception as e:
-            self._status_msg = f"Export failed: {e}"
+        ui_file_ops.cb_file_selected(self, sender, app_data)
 
     def _cb_mouse_wheel(self, sender, app_data):
-        """Handle mouse wheel scroll for image zoom."""
+        """Handle mouse wheel scroll: histogram zoom when over hist plot, image zoom when over image panel."""
+        if self._mouse_over_histogram():
+            self._cb_histogram_wheel(app_data)
+            return
         if self.image_viewport is None:
             return
         if self.image_viewport.handle_wheel(app_data):
             self._resize_image()
+
+    def _mouse_over_histogram(self) -> bool:
+        """True if mouse is over the histogram plot (rect-based; is_item_hovered unreliable for plots)."""
+        if not dpg.does_item_exist("hist_plot"):
+            return False
+        try:
+            rmin = dpg.get_item_rect_min("hist_plot")
+            rmax = dpg.get_item_rect_max("hist_plot")
+            mx, my = dpg.get_mouse_pos(local=False)
+        except Exception:
+            return False
+        if rmin is None or rmax is None:
+            return False
+        x0, y0 = rmin
+        x1, y1 = rmax
+        return x0 <= mx <= x1 and y0 <= my <= y1
+
+    def _cb_histogram_wheel(self, app_data: float):
+        """Zoom histogram X-axis towards mouse position when wheel scroll over hist plot."""
+        try:
+            axis_lo, axis_hi = dpg.get_axis_limits("hist_x")
+        except Exception:
+            return
+        span = axis_hi - axis_lo
+        if span <= 0:
+            return
+        try:
+            rmin = dpg.get_item_rect_min("hist_plot")
+            rmax = dpg.get_item_rect_max("hist_plot")
+            mx, my = dpg.get_mouse_pos(local=False)
+        except Exception:
+            return
+        if rmin is None or rmax is None:
+            return
+        x0, y0 = rmin
+        x1, y1 = rmax
+        plot_w = x1 - x0
+        if plot_w <= 0:
+            return
+        rel_x = max(0.0, min(1.0, (mx - x0) / plot_w))
+        data_x = axis_lo + rel_x * span
+        zoom_factor = 1.15 if app_data > 0 else (1.0 / 1.15)
+        new_span = span * zoom_factor
+        dmax = self._get_display_max_value()
+        new_span = max(50.0, min(dmax, new_span))
+        if abs(new_span - dmax) < 1.0:
+            self._hist_zoom_lo = None
+            self._hist_zoom_hi = None
+            self._request_window_refresh()
+            return
+        half = new_span / 2.0
+        new_lo = data_x - half
+        new_hi = data_x + half
+        if new_lo < 0:
+            new_lo, new_hi = 0.0, new_span
+        if new_hi > dmax:
+            new_lo, new_hi = dmax - new_span, dmax
+        self._hist_zoom_lo = max(0.0, new_lo)
+        self._hist_zoom_hi = min(dmax, new_hi)
+        dpg.set_axis_limits("hist_x", self._hist_zoom_lo, self._hist_zoom_hi)
 
     def _cb_mouse_click(self, sender, app_data):
         """Handle mouse click to start drag/pan."""
@@ -1733,387 +969,8 @@ class XrayGUI:
     # ── Build UI ────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # Frame size from selected detector module (highest camera_priority among enabled)
-        detector_modules = [m for m in self._discovered_modules if m.get("type") == "detector" and self._module_enabled.get(m["name"], False)]
-        detector_modules.sort(key=lambda m: m.get("camera_priority", 0), reverse=True)
-        if detector_modules:
-            try:
-                cam_mod = __import__(detector_modules[0]["import_path"], fromlist=["get_frame_size"])
-                self.frame_width, self.frame_height = cam_mod.get_frame_size()
-            except Exception:
-                self.frame_width, self.frame_height = DEFAULT_FRAME_W, DEFAULT_FRAME_H
-        else:
-            self.frame_width, self.frame_height = DEFAULT_FRAME_W, DEFAULT_FRAME_H
-        self._disp_w = self.frame_width // self.disp_scale
-        self._disp_h = self.frame_height // self.disp_scale
-        self._aspect = self.frame_width / self.frame_height
-        # Bad pixel map is per resolution; clear so module can load/build for current size
-        self.bad_pixel_map_mask = None
-
-        # Build image alteration pipeline (slot, process_frame) and distortion-only sublist for live preview
-        image_processing_modules = [m for m in self._discovered_modules if m.get("type") == "image_processing" and self._module_enabled.get(m["name"], False)]
-        image_processing_modules.sort(key=lambda m: m.get("pipeline_slot", 0))
-        self._alteration_pipeline = []
-        self._pipeline_module_slots = {}
-        for m in image_processing_modules:
-            try:
-                mod = __import__(m["import_path"], fromlist=["process_frame"])
-                pf = getattr(mod, "process_frame", None)
-                if callable(pf):
-                    slot = m.get("pipeline_slot", 0)
-                    name = m["name"]
-                    self._alteration_pipeline.append((slot, name, pf))
-                    self._pipeline_module_slots[name] = slot
-            except Exception:
-                pass
-        self._distortion_crop_pipeline = [(s, n, pf) for s, n, pf in self._alteration_pipeline if s >= self.DISTORTION_PREVIEW_SLOT]
-
-        # Warn once if an option is set (e.g. pincushion strength) but its module is not loaded
-        self.api.warn_about_unloaded_options_with_saved_values()
-
-        # Texture registry (size from disp_scale; list for initial value)
-        blank = [0.0] * (self._disp_w * self._disp_h * 4)
-        with dpg.texture_registry():
-            self._texture_id = dpg.add_dynamic_texture(
-                width=self._disp_w, height=self._disp_h, default_value=blank
-            )
-
-        # File dialog for PNG export
-        with dpg.file_dialog(
-            directory_selector=False, show=False, tag="file_dialog",
-            callback=self._cb_file_selected, width=600, height=400,
-            default_filename="xray_frame.png",
-            default_path=self._get_file_dialog_default_path(),
-        ):
-            dpg.add_file_extension(".png")
-
-        # File dialog for TIFF export (last taken image, 16-bit); default name set to dd-mm-YYYY-{time}-{gain}-{n}.tif before each show
-        with dpg.file_dialog(
-            directory_selector=False, show=False, tag="tiff_file_dialog",
-            callback=self._cb_tiff_file_selected, width=600, height=400,
-            default_filename=self._get_default_tiff_filename(),
-            default_path=self._get_file_dialog_default_path(),
-        ):
-            dpg.add_file_extension(".tif")
-            dpg.add_file_extension(".tiff")
-
-        # File dialog for Open image (File section: load as preview, then Run through processing)
-        with dpg.file_dialog(
-            directory_selector=False, show=False, tag="open_image_file_dialog",
-            callback=self._cb_open_image_file_selected, width=600, height=400,
-            default_path=self._get_file_dialog_default_path(),
-        ):
-            dpg.add_file_extension(".tif")
-            dpg.add_file_extension(".tiff")
-            dpg.add_file_extension(".png")
-
-        # Mouse wheel and drag handler registry (must be global, created before window)
-        with dpg.handler_registry(tag="wheel_handler_registry"):
-            dpg.add_mouse_wheel_handler(callback=self._cb_mouse_wheel)
-            dpg.add_mouse_click_handler(button=dpg.mvMouseButton_Left, callback=self._cb_mouse_click)
-            dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Left, callback=self._cb_mouse_drag)
-            dpg.add_mouse_release_handler(button=dpg.mvMouseButton_Left, callback=self._cb_mouse_release)
-
-        # Main window
-        with dpg.window(tag="primary"):
-            # Menu bar
-            with dpg.menu_bar():
-                with dpg.menu(label="File"):
-                    dpg.add_menu_item(label="Export PNG...", callback=self._cb_export_png)
-                    dpg.add_menu_item(label="Save as TIFF...", callback=self._cb_save_tiff)
-                    dpg.add_menu_item(label="Quit", callback=lambda: dpg.stop_dearpygui())
-                with dpg.menu(label="Settings"):
-                    dpg.add_menu_item(label="Settings...", callback=self._cb_show_settings)
-
-            # Two-column layout
-            with dpg.group(horizontal=True):
-                # Left: image display + status
-                with dpg.child_window(width=-370, tag="image_panel", no_scrollbar=True):
-                    # Image area (fixed height, no scrollbar - zoom handles panning)
-                    with dpg.child_window(width=-1, height=-115, tag="image_area", no_scrollbar=True):
-                        dpg.add_image(self._texture_id, tag="main_image")
-                    
-                    # Initialize image viewport after image widget is created
-                    self.image_viewport = ImageViewport("main_image")
-                    self.image_viewport.aspect_ratio = self._aspect
-                    # Status area at bottom (fixed height ~115px)
-                    with dpg.group(tag="status_bar_group"):
-                        dpg.add_separator()
-                        dpg.add_text("Idle", tag="status_text")
-                        dpg.add_progress_bar(default_value=0.0, tag="progress_bar", width=-1)
-                        dpg.add_text("Frames: 0 | FPS: 0.0", tag="stats_text")
-                        dpg.add_text("--", tag="diag_text")
-
-                # Right: control panel
-                with dpg.child_window(width=350, tag="control_panel"):
-                    # ── File (open image → preview with histogram; run through pipeline → processed result; Save TIF saves that)
-                    with dpg.collapsing_header(label="File", default_open=False):
-                        with dpg.group(indent=10):
-                            dpg.add_button(label="Open image", tag="file_open_image_btn", width=-1, callback=self._cb_file_open_image)
-                            dpg.add_button(label="Run through processing", tag="file_run_processing_btn", width=-1, callback=self._cb_file_run_through_processing)
-                            dpg.add_button(label="Save TIF", tag="file_save_tiff_btn", width=-1, callback=self._cb_file_save_tiff, enabled=False)
-
-                    # ── Connection (from selected detector module or placeholder) ──
-                    if detector_modules:
-                        try:
-                            cam_mod = __import__(detector_modules[0]["import_path"], fromlist=["build_ui"])
-                            cam_mod.build_ui(self, "control_panel")
-                            self.camera_module_name = detector_modules[0]["name"]
-                            self._load_dark_field()
-                            self._load_flat_field()
-                        except Exception:
-                            self.camera_module_name = None
-                            with dpg.collapsing_header(label="Connection", default_open=True):
-                                with dpg.group(indent=10):
-                                    dpg.add_text("No detector module loaded.", color=[150, 150, 150])
-                                    dpg.add_text("Enable a detector module in Settings (applies on next startup).", color=[120, 120, 120])
-                    else:
-                        self.camera_module_name = None
-                        with dpg.collapsing_header(label="Connection", default_open=True):
-                            with dpg.group(indent=10):
-                                dpg.add_text("No detector module loaded.", color=[150, 150, 150])
-                                dpg.add_text("Enable a detector module in Settings (applies on next startup).", color=[120, 120, 120])
-
-                    # ── Acquisition (mode list from detector module if loaded) ──
-                    with dpg.collapsing_header(label="Acquisition", default_open=True):
-                        with dpg.group(indent=10):
-                            if self.camera_module is not None:
-                                modes = self.camera_module.get_acquisition_modes()
-                                acq_items = [label for label, _ in modes]
-                                self._acquisition_mode_map = {label: mode_id for label, mode_id in modes}
-                            else:
-                                acq_items = ["Single Shot", "Dual Shot", "Continuous", "Capture N"]
-                                self._acquisition_mode_map = {
-                                    "Single Shot": "single", "Dual Shot": "dual",
-                                    "Continuous": "continuous", "Capture N": "capture_n",
-                                }
-                            saved_acq = self._loaded_settings.get("acq_mode", "Dual Shot")
-                            default_acq = saved_acq if saved_acq in acq_items else (acq_items[0] if acq_items else "Dual Shot")
-                            dpg.add_combo(
-                                items=acq_items,
-                                default_value=default_acq, tag="acq_mode_combo", width=-1,
-                                callback=lambda s, a: self._save_settings()
-                            )
-                            integ_choices = getattr(self.camera_module, "get_integration_choices", lambda: None)()
-                            if integ_choices is None:
-                                integ_choices = INTEGRATION_CHOICES
-                            saved_integ = self._loaded_settings.get("integ_time", "1 s")
-                            default_integ = saved_integ if saved_integ in integ_choices else (integ_choices[0] if integ_choices else "1 s")
-                            dpg.add_combo(
-                                items=integ_choices,
-                                default_value=default_integ, tag="integ_time_combo", width=-1,
-                                callback=self._cb_integ_time_changed
-                            )
-                            dpg.add_text("(trigger interval = integration time)", color=[120, 120, 120, 255])
-                            with dpg.group(horizontal=True):
-                                dpg.add_button(label="Start", callback=self._cb_start, width=115)
-                                dpg.add_button(label="Stop", callback=self._cb_stop, width=115)
-
-                    # ── Integration ──
-                    with dpg.collapsing_header(label="Integration", default_open=True):
-                        with dpg.group(indent=10):
-                            dpg.add_slider_int(
-                                label="N frames", default_value=self._loaded_settings.get("integ_n", 1),
-                                min_value=1, max_value=32, tag="integ_n_slider", width=-60,
-                                callback=lambda s, a: self._save_settings()
-                            )
-                            with dpg.group(horizontal=True):
-                                dpg.add_button(label="Clear Buffer", callback=self._cb_clear_buffer, width=115)
-                                dpg.add_button(label="Capture N", callback=self._cb_capture_n, width=115)
-
-                    # ── Image Controls ──
-                    with dpg.collapsing_header(label="Image", default_open=True):
-                        with dpg.group(indent=10):
-                            # Clamp window to current camera bit depth (12/14/16) so saved values match sensor range.
-                            self.win_min, self.win_max = self._clamp_window_bounds(self.win_min, self.win_max)
-                            with dpg.group(horizontal=True):
-                                dpg.add_button(label="Auto Window", callback=self._cb_auto_window, width=115)
-                                dpg.add_checkbox(label="Hist EQ", default_value=self.hist_eq, callback=self._cb_hist_eq_toggle, tag="hist_eq_cb")
-                            dpg.add_input_float(
-                                label="Min", default_value=self.win_min,
-                                callback=self._cb_win_min_changed, tag="win_min_drag", width=-40,
-                                on_enter=True, min_value=0.0, min_clamped=True,
-                                max_value=self._get_display_max_value(), max_clamped=True
-                            )
-                            dpg.add_input_float(
-                                label="Max", default_value=self.win_max,
-                                callback=self._cb_win_max_changed, tag="win_max_drag", width=-40,
-                                on_enter=True, min_value=0.0, min_clamped=True,
-                                max_value=self._get_display_max_value(), max_clamped=True
-                            )
-
-                    # ── Histogram ──
-                    with dpg.collapsing_header(label="Histogram", default_open=True):
-                        with dpg.group(indent=10):
-                            with dpg.plot(
-                                height=120, width=-1, tag="hist_plot",
-                                no_title=True, no_mouse_pos=True,
-                                no_box_select=True,
-                            ):
-                                dpg.add_plot_axis(
-                                    dpg.mvXAxis, label="", tag="hist_x",
-                                    no_tick_labels=True,
-                                )
-                                with dpg.plot_axis(
-                                    dpg.mvYAxis, label="", tag="hist_y",
-                                    no_tick_labels=True, lock_min=True, lock_max=True,
-                                ):
-                                    dpg.add_shade_series(
-                                        [0], [0], y2=[0], tag="hist_series"
-                                    )
-                                # Draggable lines for min/max
-                                dpg.add_drag_line(
-                                    label="Min", color=[255, 100, 100, 255],
-                                    default_value=self.win_min, tag="hist_min_line",
-                                    callback=self._cb_hist_min_dragged
-                                )
-                                dpg.add_drag_line(
-                                    label="Max", color=[100, 100, 255, 255],
-                                    default_value=self.win_max, tag="hist_max_line",
-                                    callback=self._cb_hist_max_dragged
-                                )
-
-                    # ── Dark Field (only when Dark correction module is enabled) ──
-                    if self._module_enabled.get("dark_correction", False):
-                        with dpg.collapsing_header(label="Dark Field", default_open=False):
-                            with dpg.group(indent=10):
-                                dpg.add_slider_int(
-                                    label="Stack", default_value=self._dark_stack_n,
-                                    min_value=1, max_value=50, tag="dark_stack_slider", width=-120,
-                                    callback=lambda s, a: self._save_settings()
-                                )
-                                with dpg.group(horizontal=True):
-                                    dpg.add_button(label="Capture Dark", callback=self._cb_capture_dark, width=115)
-                                    dpg.add_button(label="Clear Dark", callback=self._cb_clear_dark, width=115)
-                                dpg.add_text(self._dark_status_text(), tag="dark_status")
-
-                    # ── Flat Field (only when Flat correction module is enabled) ──
-                    if self._module_enabled.get("flat_correction", False):
-                        with dpg.collapsing_header(label="Flat Field", default_open=False):
-                            with dpg.group(indent=10):
-                                dpg.add_slider_int(
-                                    label="Stack", default_value=self._flat_stack_n,
-                                    min_value=1, max_value=50, tag="flat_stack_slider", width=-120,
-                                    callback=lambda s, a: self._save_settings()
-                                )
-                                with dpg.group(horizontal=True):
-                                    dpg.add_button(label="Capture Flat", callback=self._cb_capture_flat, width=115)
-                                    dpg.add_button(label="Clear Flat", callback=self._cb_clear_flat, width=115)
-                                dpg.add_text(self._flat_status_text(), tag="flat_status")
-
-                    # ── Image processing modules (in pipeline order by slot: dark 100, flat 200, banding 300, dead_pixel 400) ──
-                    image_processing_for_ui = [m for m in self._discovered_modules if m.get("type") == "image_processing" and self._module_enabled.get(m["name"], False)]
-                    image_processing_for_ui.sort(key=lambda m: m.get("pipeline_slot", 0))
-                    for m in image_processing_for_ui:
-                        try:
-                            mod = __import__(m["import_path"], fromlist=["build_ui"])
-                            mod.build_ui(self, "control_panel")
-                        except Exception:
-                            pass
-
-                    # ── Manual alteration modules (user-triggered, e.g. Deconvolution Apply/Revert) ──
-                    for m in self._discovered_modules:
-                        if m.get("type") != "manual_alteration" or not self._module_enabled.get(m["name"], False):
-                            continue
-                        try:
-                            mod = __import__(m["import_path"], fromlist=["build_ui"])
-                            mod.build_ui(self, "control_panel")
-                        except Exception:
-                            pass
-
-                    # ── Machine modules (discovered; each enabled module builds its UI) ──
-                    for m in self._discovered_modules:
-                        if m.get("type") != "machine" or not self._module_enabled.get(m["name"], False):
-                            continue
-                        try:
-                            mod = __import__(m["import_path"], fromlist=["build_ui"])
-                            mod.build_ui(self, "control_panel")
-                        except Exception:
-                            pass
-
-                    # ── Workflow automation modules (e.g. CT capture) ──
-                    for m in self._discovered_modules:
-                        if m.get("type") != "workflow_automation" or not self._module_enabled.get(m["name"], False):
-                            continue
-                        try:
-                            mod = __import__(m["import_path"], fromlist=["build_ui"])
-                            mod.build_ui(self, "control_panel")
-                        except Exception:
-                            pass
-
-        # Settings window (menu: Settings → Settings...)
-        _disp_scale_labels = {"1": "1 - Full", "2": "2 - Half", "4": "4 - Quarter"}
-        with dpg.window(label="Settings", tag="settings_window", show=False, on_close=lambda: self._flush_pending_settings_save(force=True)):
-            dpg.add_combo(
-                label="Display scale",
-                items=["1 - Full", "2 - Half", "4 - Quarter"],
-                default_value=_disp_scale_labels.get(str(self.disp_scale), "1 - Full"),
-                tag="disp_scale_combo",
-                width=-1,
-                callback=self._cb_disp_scale
-            )
-            dpg.add_text("Reduces display resolution (block average).", color=[150, 150, 150])
-            dpg.add_spacer()
-            # Group and sort modules by type: detector, image_processing, manual_alteration, machine, workflow_automation
-            _type_order = {"detector": 0, "image_processing": 1, "manual_alteration": 2, "machine": 3, "workflow_automation": 4}
-            _type_headers = {"detector": "Detector modules", "image_processing": "Image processing modules", "manual_alteration": "Manual alteration modules", "machine": "Machine modules", "workflow_automation": "Workflow modules"}
-            def _settings_module_sort_key(m):
-                t = m.get("type", "machine")
-                order = _type_order.get(t, 3)
-                if t == "detector":
-                    return (order, -m.get("camera_priority", 0))  # higher priority first
-                if t == "image_processing" or t == "manual_alteration":
-                    return (order, m.get("pipeline_slot", 0))
-                return (order, 0)
-            _settings_modules = sorted(self._discovered_modules, key=_settings_module_sort_key)
-            _last_type = None
-            for m in _settings_modules:
-                t = m.get("type", "machine")
-                if t != _last_type:
-                    _last_type = t
-                    header = _type_headers.get(t, "Modules")
-                    dpg.add_text(header, color=[200, 200, 200])
-                    if t == "detector":
-                        detector_mods = [x for x in _settings_modules if x.get("type") == "detector"]
-                        _det_items = ["None"] + [self._detector_combo_label(x) for x in detector_mods]
-                        _det_enabled = next((self._detector_combo_label(x) for x in detector_mods if self._module_enabled.get(x["name"], False)), None)
-                        dpg.add_combo(
-                            label="Detector module",
-                            items=_det_items,
-                            default_value=_det_enabled or "None",
-                            tag="settings_detector_combo",
-                            width=-1,
-                            callback=self._cb_detector_module_combo
-                        )
-                        continue
-                if t == "detector":
-                    continue
-                tag = f"load_module_cb_{m['name']}"
-                label = f"Load {m['display_name']} module"
-                if t == "image_processing" or (t == "manual_alteration" and m.get("pipeline_slot", 0) != 0):
-                    slot = m.get("pipeline_slot", 0)
-                    label += f" (slot {slot})" if t == "image_processing" else " (post-capture)"
-                dpg.add_checkbox(
-                    label=label,
-                    default_value=self._module_enabled.get(m["name"], m.get("default_enabled", False)),
-                    tag=tag,
-                    callback=lambda s, a, name=m["name"]: self._cb_load_module(name)
-                )
-            dpg.add_spacer()
-            dpg.add_text("Module load state and display scale apply on next startup.", color=[150, 150, 150])
-            dpg.add_spacer()
-            dpg.add_separator()
-            dpg.add_text("Capture profiles", color=[200, 200, 200])
-            dpg.add_text("Save current settings as a named profile, or load a profile (restart required).", color=[150, 150, 150])
-            with dpg.group(horizontal=True):
-                dpg.add_input_text(tag="profile_name_input", default_value="", hint="Profile name", width=-120)
-                dpg.add_button(label="Save as profile", tag="profile_save_btn", callback=self._cb_save_profile, width=115)
-            dpg.add_spacer()
-            dpg.add_spacer()
-            with dpg.group(horizontal=True):
-                dpg.add_combo(tag="profile_load_combo", items=[], width=-120, callback=lambda s, a: None)
-                dpg.add_button(label="Load and restart", tag="profile_load_btn", callback=self._cb_load_profile_restart, width=115)
-            dpg.add_text("(Default: current settings.json; no profile file until you save one.)", color=[120, 120, 120])
+        """Build full UI (frame size, pipeline, texture, dialogs, main window, settings window). Delegates to ui.build_ui."""
+        ui_build_ui.build_ui(self)
 
     def _cb_show_settings(self, sender=None, app_data=None):
         """Open the Settings window and sync combo and module checkboxes to current values."""
