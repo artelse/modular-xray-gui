@@ -11,6 +11,7 @@ import re
 import time
 import threading
 import pathlib
+from datetime import datetime
 import shutil
 import math
 import numpy as np
@@ -34,9 +35,11 @@ from modules.registry import discover_modules, all_extra_settings_keys
 DEFAULT_FRAME_W = 2400
 DEFAULT_FRAME_H = 2400
 # Master darks saved in app/darks/, flats in app/flats/, bad pixel maps (TIFF review) in app/pixelmaps/
+# Default folder for open/save file dialogs when no last path is stored
 DARK_DIR = pathlib.Path(__file__).resolve().parent / "darks"
 FLAT_DIR = pathlib.Path(__file__).resolve().parent / "flats"
 PIXELMAPS_DIR = pathlib.Path(__file__).resolve().parent / "pixelmaps"
+CAPTURES_DIR = pathlib.Path(__file__).resolve().parent / "captures"
 LAST_CAPTURED_DARK_NAME = "last_captured_dark.npy"
 LAST_CAPTURED_FLAT_NAME = "last_captured_flat.npy"
 INTEGRATION_CHOICES = ["0.5 s", "1 s", "2 s", "5 s", "10 s", "15 s", "20 s"]
@@ -247,6 +250,8 @@ class XrayGUI:
         self._window_sync_guard = False
         # Coalesce expensive texture/histogram redraws from rapid windowing callbacks
         self._window_refresh_pending = False
+        # File section: image opened for preview (run through pipeline → becomes processed result; Save TIF then saves it)
+        self._file_preview_frame = None  # float32 (H,W) or None
 
         # DPG ids (assigned in _build_ui)
         self._texture_id = None
@@ -316,11 +321,33 @@ class XrayGUI:
         self.deconv_sigma = max(0.2, min(10.0, float(s.get("deconv_sigma", 1.0))))
         self.deconv_iterations = max(1, min(100, int(s.get("deconv_iterations", 10))))
         self.disp_scale = max(1, min(4, int(s.get("disp_scale", 1))))  # 1=full, 2=half, 4=quarter
+        # Last folder used for open/save file dialogs; default to app/captures when not set or invalid
+        last_dir = (s.get("last_file_dialog_dir") or "").strip()
+        if last_dir and pathlib.Path(last_dir).is_dir():
+            self._last_file_dialog_dir = last_dir
+        else:
+            self._last_file_dialog_dir = str(CAPTURES_DIR)
         # Module enable flags (from registry; key = load_<name>_module)
         self._module_enabled = {}
         for m in self._discovered_modules:
             key = f"load_{m['name']}_module"
             self._module_enabled[m["name"]] = bool(s.get(key, m.get("default_enabled", False)))
+
+    def _get_file_dialog_default_path(self) -> str:
+        """Directory to open file dialogs in; defaults to app/captures if none saved or invalid."""
+        p = pathlib.Path(getattr(self, "_last_file_dialog_dir", "") or str(CAPTURES_DIR))
+        if not p.is_dir():
+            p = CAPTURES_DIR
+        p.mkdir(parents=True, exist_ok=True)
+        return str(p)
+
+    def _get_default_tiff_filename(self) -> str:
+        """Default TIFF save name: dd-mm-YYYY-{exposuretime}-{gain}-{integration count}.tif"""
+        date_str = datetime.now().strftime("%d-%m-%Y")
+        integ_time = self._parse_integration_time(dpg.get_value("integ_time_combo")) if dpg.does_item_exist("integ_time_combo") else self.integration_time
+        gain = self._get_camera_gain()
+        n = int(dpg.get_value("integ_n_slider")) if dpg.does_item_exist("integ_n_slider") else self.integration_n
+        return f"{date_str}-{integ_time}-{gain}-{n}.tif"
 
     def clear_frame_buffer(self):
         """Clear the integration buffer and display so the next submitted frame(s) are the only content. Call before submitting when loading a new image (e.g. Open Image module)."""
@@ -394,6 +421,7 @@ class XrayGUI:
             s["win_max"] = float(dpg.get_value("win_max_drag"))
             s["hist_eq"] = dpg.get_value("hist_eq_cb")
             s["disp_scale"] = self.disp_scale
+            s["last_file_dialog_dir"] = getattr(self, "_last_file_dialog_dir", "") or ""
             # Each module contributes its own settings (gui passed so modules can read DPG or fallback to gui state)
             for m in self._discovered_modules:
                 try:
@@ -1520,12 +1548,87 @@ class XrayGUI:
         if self._get_export_frame() is None:
             self._status_msg = "No frame to export"
             return
+        dpg.configure_item("file_dialog", default_path=self._get_file_dialog_default_path())
         dpg.show_item("file_dialog")
 
     def _cb_save_tiff(self, sender=None, app_data=None):
         if self._get_export_frame() is None:
             self._status_msg = "No frame to save"
             return
+        dpg.configure_item("tiff_file_dialog", default_path=self._get_file_dialog_default_path(), default_filename=self._get_default_tiff_filename())
+        dpg.show_item("tiff_file_dialog")
+
+    def _load_image_file_as_float32(self, path: str) -> np.ndarray:
+        """Load TIFF or PNG as 2D float32, resized to current frame size. Raises on error."""
+        try:
+            import tifffile
+            arr = tifffile.imread(path)
+        except Exception:
+            from PIL import Image
+            arr = np.array(Image.open(path))
+        if arr is None or arr.size == 0:
+            raise ValueError("Empty or invalid image")
+        if arr.ndim == 3:
+            arr = arr[:, :, 0] if arr.shape[2] >= 1 else arr.squeeze()
+        if arr.ndim != 2:
+            arr = arr.squeeze()
+        arr = np.asarray(arr, dtype=np.float32)
+        h, w = getattr(self, "frame_height", DEFAULT_FRAME_H), getattr(self, "frame_width", DEFAULT_FRAME_W)
+        if arr.shape[0] != h or arr.shape[1] != w:
+            try:
+                from skimage.transform import resize
+                arr = resize(arr, (h, w), order=1, preserve_range=True).astype(np.float32)
+            except Exception:
+                from scipy.ndimage import zoom
+                zoom_h = h / arr.shape[0]
+                zoom_w = w / arr.shape[1]
+                arr = zoom(arr, (zoom_h, zoom_w), order=1)[:h, :w].astype(np.float32)
+        return arr
+
+    def _cb_file_open_image(self, sender=None, app_data=None):
+        dpg.configure_item("open_image_file_dialog", default_path=self._get_file_dialog_default_path())
+        dpg.show_item("open_image_file_dialog")
+
+    def _cb_open_image_file_selected(self, sender, app_data):
+        if not app_data:
+            return
+        path = app_data.get("file_path_name", "")
+        if isinstance(path, (list, tuple)):
+            path = path[0] if path else ""
+        if not path:
+            return
+        try:
+            frame = self._load_image_file_as_float32(path)
+            self._file_preview_frame = frame
+            self._paint_preview_to_main_view(frame, use_histogram=True)
+            self._status_msg = f"Opened: {os.path.basename(path)}"
+            dir_path = os.path.dirname(path)
+            if dir_path and pathlib.Path(dir_path).is_dir():
+                self._last_file_dialog_dir = dir_path
+                self._save_settings()
+        except Exception as e:
+            self._status_msg = f"Open failed: {e}"
+            self._file_preview_frame = None
+
+    def _cb_file_run_through_processing(self, sender=None, app_data=None):
+        if self._file_preview_frame is None:
+            self._status_msg = "Open an image first"
+            return
+        frame = self._file_preview_frame
+        self._clear_main_view_preview()
+        self.clear_frame_buffer()
+        self._push_frame(frame)
+        self._file_preview_frame = None
+        with self.frame_lock:
+            if self.display_frame is not None:
+                self._paint_texture_from_frame(self.display_frame.copy())
+        self._status_msg = "Processed; you can Save TIF"
+
+    def _cb_file_save_tiff(self, sender=None, app_data=None):
+        if self._get_export_frame() is None:
+            self._status_msg = "No frame to save (run an image through processing first)"
+            return
+        dpg.configure_item("tiff_file_dialog", default_path=self._get_file_dialog_default_path(), default_filename=self._get_default_tiff_filename())
         dpg.show_item("tiff_file_dialog")
 
     def _cb_tiff_file_selected(self, sender, app_data):
@@ -1534,6 +1637,10 @@ class XrayGUI:
             return
         if not filepath.lower().endswith((".tif", ".tiff")):
             filepath += ".tif"
+        dir_path = os.path.dirname(filepath)
+        if dir_path and pathlib.Path(dir_path).is_dir():
+            self._last_file_dialog_dir = dir_path
+            self._save_settings()
         frame = self._get_export_frame()
         if frame is None:
             self._status_msg = "No frame to save"
@@ -1573,6 +1680,10 @@ class XrayGUI:
             return
         if not filepath.lower().endswith(".png"):
             filepath += ".png"
+        dir_path = os.path.dirname(filepath)
+        if dir_path and pathlib.Path(dir_path).is_dir():
+            self._last_file_dialog_dir = dir_path
+            self._save_settings()
         frame = self._get_export_frame()
         if frame is None:
             self._status_msg = "No frame to export"
@@ -1671,18 +1782,30 @@ class XrayGUI:
         with dpg.file_dialog(
             directory_selector=False, show=False, tag="file_dialog",
             callback=self._cb_file_selected, width=600, height=400,
-            default_filename="xray_frame.png"
+            default_filename="xray_frame.png",
+            default_path=self._get_file_dialog_default_path(),
         ):
             dpg.add_file_extension(".png")
 
-        # File dialog for TIFF export (last taken image, 16-bit)
+        # File dialog for TIFF export (last taken image, 16-bit); default name set to dd-mm-YYYY-{time}-{gain}-{n}.tif before each show
         with dpg.file_dialog(
             directory_selector=False, show=False, tag="tiff_file_dialog",
             callback=self._cb_tiff_file_selected, width=600, height=400,
-            default_filename="xray_frame.tif"
+            default_filename=self._get_default_tiff_filename(),
+            default_path=self._get_file_dialog_default_path(),
         ):
             dpg.add_file_extension(".tif")
             dpg.add_file_extension(".tiff")
+
+        # File dialog for Open image (File section: load as preview, then Run through processing)
+        with dpg.file_dialog(
+            directory_selector=False, show=False, tag="open_image_file_dialog",
+            callback=self._cb_open_image_file_selected, width=600, height=400,
+            default_path=self._get_file_dialog_default_path(),
+        ):
+            dpg.add_file_extension(".tif")
+            dpg.add_file_extension(".tiff")
+            dpg.add_file_extension(".png")
 
         # Mouse wheel and drag handler registry (must be global, created before window)
         with dpg.handler_registry(tag="wheel_handler_registry"):
@@ -1723,6 +1846,13 @@ class XrayGUI:
 
                 # Right: control panel
                 with dpg.child_window(width=350, tag="control_panel"):
+                    # ── File (open image → preview with histogram; run through pipeline → processed result; Save TIF saves that)
+                    with dpg.collapsing_header(label="File", default_open=False):
+                        with dpg.group(indent=10):
+                            dpg.add_button(label="Open image", tag="file_open_image_btn", width=-1, callback=self._cb_file_open_image)
+                            dpg.add_button(label="Run through processing", tag="file_run_processing_btn", width=-1, callback=self._cb_file_run_through_processing)
+                            dpg.add_button(label="Save TIF", tag="file_save_tiff_btn", width=-1, callback=self._cb_file_save_tiff, enabled=False)
+
                     # ── Connection (from selected detector module or placeholder) ──
                     if detector_modules:
                         try:
@@ -2212,6 +2342,10 @@ class XrayGUI:
             has_frame = (self.display_frame is not None) or (self._deconv_raw_frame is not None)
             dpg.configure_item("deconv_apply_btn", enabled=idle and has_frame)
             dpg.configure_item("deconv_revert_btn", enabled=idle and self._deconv_raw_frame is not None)
+
+        # File section: enable Save TIF only when there is a processed result to save
+        if dpg.does_item_exist("file_save_tiff_btn"):
+            dpg.configure_item("file_save_tiff_btn", enabled=(self._get_export_frame() is not None))
 
         # Machine module tick callbacks (e.g. ESP HV state refresh)
         for cb in getattr(self, "_machine_module_tick_callbacks", []):

@@ -27,6 +27,7 @@ CORE_DEFAULTS = {
     "hist_eq": False,
     "disp_scale": 1,  # 1=full res, 2=half, 4=quarter (display only; applies on next startup)
     "current_profile": "",  # last loaded or saved profile name (for Settings UI)
+    "last_file_dialog_dir": "",  # last folder used for open/save; empty => use app/captures
 }
 
 # DEFAULTS will be built at runtime by combining CORE_DEFAULTS with module defaults
