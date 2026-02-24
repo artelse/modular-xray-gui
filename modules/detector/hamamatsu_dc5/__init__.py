@@ -5,6 +5,7 @@ USB connection via lib/hamamatsu_dc5; integration time 30 ms–10 s, 14-bit sens
 
 from typing import Optional
 import threading
+import time
 import numpy as np
 import dearpygui.dearpygui as dpg
 
@@ -177,6 +178,7 @@ class HamamatsuDC5Module:
                     i += 1
                     api.set_progress(0.0, f"Continuous #{i}")
                     self._do_single_shot(gui)
+                    time.sleep(0.15)  # small delay between readout and next capture
             elif mode == "capture_n":
                 n = api.get_integration_frame_count()
                 for i in range(n):
@@ -184,6 +186,8 @@ class HamamatsuDC5Module:
                         break
                     api.set_progress(i / max(n, 1), f"Capturing {i+1}/{n}")
                     self._do_single_shot(gui)
+                    if i < n - 1:
+                        time.sleep(0.15)  # small delay between readout and next capture
                 api.set_progress(1.0)
         except Exception as e:
             api.set_status_message(f"Error: {e}")

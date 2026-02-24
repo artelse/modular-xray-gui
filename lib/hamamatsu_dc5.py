@@ -175,12 +175,14 @@ def _capture_one_frame_sync(dev, width: int, height: int, depth: int = 2,
     """
     Capture one frame: wait for MSG_BEGIN, read image+footer (imgsz+2), then MSG_END.
     Returns (raw_image_bytes, average) or None on error/abort.
-    When should_abort is set, use shorter read timeouts and return None if it returns True (allows Stop during frame).
+    When should_abort is set, use a per-read timeout that allows abort checks but avoids LIBUSB_ERROR_TIMEOUT
+    (camera may take integration_time to send first bytes; single bulk read can exceed 400 ms).
     """
     imgsz = width * height * depth
     imgx_sz = imgsz + 2
     t0 = time.time()
-    read_timeout_ms = 400 if should_abort else BULK_READ_TIMEOUT_MS
+    # Long enough for exposure delay + one chunk; short enough to check should_abort periodically (5 s)
+    read_timeout_ms = 5000 if should_abort else BULK_READ_TIMEOUT_MS
 
     # Wait for MSG_BEGIN (first 2 bytes of a read); remainder of same read is image data
     rawbuff = bytearray()
@@ -188,6 +190,8 @@ def _capture_one_frame_sync(dev, width: int, height: int, depth: int = 2,
         if should_abort and should_abort():
             return None
         chunk = dev.bulkRead(EP_BULK, 512, timeout=read_timeout_ms)
+        if should_abort:
+            time.sleep(0)  # yield GIL so main thread can process HV Off / UI
         if len(chunk) < 2:
             continue
         sync = _is_sync(chunk)
@@ -204,6 +208,8 @@ def _capture_one_frame_sync(dev, width: int, height: int, depth: int = 2,
         if should_abort and should_abort():
             return None
         chunk = dev.bulkRead(EP_BULK, BULK_CHUNK, timeout=read_timeout_ms)
+        if should_abort:
+            time.sleep(0)  # yield GIL so main thread can process HV Off / UI
         if (time.time() - t0) * 1000 >= timeout_ms:
             raise TimeoutError("Timeout reading frame data")
         if len(chunk) < 2:
